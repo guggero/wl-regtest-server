@@ -1,0 +1,94 @@
+name: wl-regtest
+services:
+  bitcoin:
+    image: lightninglabs/bitcoin-core:29
+    command:
+      - -regtest
+      - -server
+      - -txindex
+      - -rpcbind=0.0.0.0
+      - -rpcallowip=0.0.0.0/0
+      - -rpcuser=regtest
+      - -rpcpassword=regtest
+      - -fallbackfee=0.0002
+      - -zmqpubrawblock=tcp://0.0.0.0:28332
+      - -zmqpubrawtx=tcp://0.0.0.0:28333
+    ports: ["127.0.0.1:${WL_BITCOIN_PORT:-18453}:18443"]
+    volumes: ["bitcoin:/home/bitcoin/.bitcoin"]
+  esplora:
+    image: mempool/electrs:v3.4.0-dev1
+    user: "0:0"
+    depends_on: [bitcoin]
+    command:
+      - --network=regtest
+      - --cookie=regtest:regtest
+      - --daemon-rpc-addr=bitcoin:18443
+      - --daemon-dir=/bitcoin
+      - --db-dir=/index
+      - --http-addr=0.0.0.0:3000
+      - --electrum-rpc-addr=0.0.0.0:60601
+      - --cors=*
+    volumes: ["bitcoin:/bitcoin:ro", "esplora:/index"]
+    ports: ["127.0.0.1:${WL_ESPLORA_PORT:-3010}:3000"]
+    restart: unless-stopped
+  lnd:
+    image: guggero/wl-regtest-lnd:8ea98fd
+    build:
+      context: ..
+      dockerfile: docker/lnd.Dockerfile
+    command:
+      - --noseedbackup
+      - --alias=wl-operator
+      - --rpclisten=0.0.0.0:10009
+      - --listen=0.0.0.0:9735
+      - --tlsextradomain=lnd
+      - --bitcoin.regtest
+      - --bitcoin.node=bitcoind
+      - --bitcoind.rpchost=bitcoin:18443
+      - --bitcoind.rpcuser=regtest
+      - --bitcoind.rpcpass=regtest
+      - --bitcoind.zmqpubrawblock=tcp://bitcoin:28332
+      - --bitcoind.zmqpubrawtx=tcp://bitcoin:28333
+      - --requireinterceptor
+    depends_on: [bitcoin]
+    volumes: ["lnd:/root/.lnd"]
+    restart: unless-stopped
+  peer:
+    image: guggero/wl-regtest-lnd:8ea98fd
+    command:
+      - --noseedbackup
+      - --alias=wl-external-peer
+      - --rpclisten=0.0.0.0:10009
+      - --listen=0.0.0.0:9735
+      - --bitcoin.regtest
+      - --bitcoin.node=bitcoind
+      - --bitcoind.rpchost=bitcoin:18443
+      - --bitcoind.rpcuser=regtest
+      - --bitcoind.rpcpass=regtest
+      - --bitcoind.zmqpubrawblock=tcp://bitcoin:28332
+      - --bitcoind.zmqpubrawtx=tcp://bitcoin:28333
+    depends_on: [bitcoin]
+    volumes: ["peer:/root/.lnd"]
+    restart: unless-stopped
+  wavelength:
+    image: guggero/wl-regtest-server:dev
+    build:
+      context: ..
+    environment:
+      WL_DATA_DIR: /data
+      BITCOIN_RPC_URL: http://bitcoin:18443
+      BITCOIN_RPC_USER: regtest
+      BITCOIN_RPC_PASSWORD: regtest
+      LND_RPC_ADDRESS: lnd:10009
+      LND_TLS_CERT: /lnd/tls.cert
+      LND_MACAROON: /lnd/data/chain/bitcoin/regtest/admin.macaroon
+    depends_on: [lnd]
+    volumes: ["operator:/data", "lnd:/lnd:ro"]
+    ports: ["127.0.0.1:${WL_SERVER_PORT:-10020}:10010"]
+    restart: unless-stopped
+volumes:
+  bitcoin:
+  esplora:
+  lnd:
+  peer:
+  operator:

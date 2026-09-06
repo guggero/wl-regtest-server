@@ -1,0 +1,26 @@
+# The operator uses an existing funded Bitcoin Core/LND regtest environment.
+# Point the RPC URLs at those services and mount the LND credential directory.
+services:
+  wavelength:
+    image: ${WAVELENGTH_IMAGE:-guggero/wl-regtest-server:dev}
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${WAVELENGTH_PORT:-10010}:10010"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      WL_DATA_DIR: /data
+      BITCOIN_RPC_URL: ${BITCOIN_RPC_URL:-http://host.docker.internal:18443}
+      BITCOIN_RPC_USER: ${BITCOIN_RPC_USER:-regtest}
+      BITCOIN_RPC_PASSWORD: ${BITCOIN_RPC_PASSWORD:?set the Bitcoin RPC password}
+      LND_RPC_ADDRESS: ${LND_RPC_ADDRESS:-host.docker.internal:10009}
+      LND_TLS_CERT: /lnd/tls.cert
+      LND_MACAROON: /lnd/data/chain/bitcoin/regtest/admin.macaroon
+    volumes:
+      - wavelength:/data
+      - ${LND_DATA_DIR:?set the absolute LND data directory}:/lnd:ro
+volumes:
+  wavelength:
