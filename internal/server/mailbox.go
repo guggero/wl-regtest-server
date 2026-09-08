@@ -97,6 +97,10 @@ func authenticate(ctx context.Context, owner, recipient string,
 	if err != nil {
 		return err
 	}
+
+	// Accept transport metadata or the envelope header used by mailbox
+	// clients, but verify the signature against the exact addressed
+	// mailbox.
 	md, _ := metadata.FromIncomingContext(ctx)
 	sig := ""
 	if values := md.Get(serverconn.AuthHeaderKey); len(values) == 1 {
@@ -117,9 +121,14 @@ func authenticate(ctx context.Context, owner, recipient string,
 }
 
 // Send durably admits one authenticated request without executing it inline.
+// Success acknowledges durable admission, not domain completion. Mutation
+// retries must preserve the body and routing under their sender-scoped key;
+// conflicts return AlreadyExists. Heartbeats bypass durable admission.
 func (s *Server) Send(ctx context.Context,
 	req *mailboxpb.SendRequest) (*mailboxpb.SendResponse, error) {
 
+	// Reject unsupported envelopes and versions before admission; the
+	// durable dispatcher assumes a typed request or protocol event.
 	e := req.GetEnvelope()
 	if e == nil || e.Rpc == nil || (e.Rpc.Kind != mailboxpb.RpcMeta_KIND_REQUEST &&
 		e.Rpc.Kind != mailboxpb.RpcMeta_KIND_EVENT) {
@@ -140,6 +149,10 @@ func (s *Server) Send(ctx context.Context,
 			},
 		}}, nil
 	}
+
+	// Bind routing and reply identity to the authenticated sender so an
+	// envelope cannot redirect a response or impersonate another
+	// participant.
 	if e.Recipient != serverconn.CompoundMailboxID(s.id, e.Sender) ||
 		e.Rpc.ReplyTo != e.Sender {
 
@@ -153,6 +166,9 @@ func (s *Server) Send(ctx context.Context,
 
 		return nil, err
 	}
+
+	// Authenticated heartbeats only keep the connection active; they carry
+	// no durable domain operation and do not need a request ledger entry.
 	if e.Rpc.Service == serverconn.HeartbeatService &&
 		e.Rpc.Method == serverconn.HeartbeatMethod &&
 		e.Rpc.Kind == mailboxpb.RpcMeta_KIND_EVENT {
@@ -163,6 +179,9 @@ func (s *Server) Send(ctx context.Context,
 			},
 		}, nil
 	}
+
+	// Economic requests need stable retry identity and bounded serialized
+	// contents before consuming durable storage.
 	if e.Body == nil || e.IdempotencyKey == "" || (e.Rpc.Kind == mailboxpb.RpcMeta_KIND_REQUEST &&
 		e.Rpc.CorrelationId == "") {
 
@@ -203,6 +222,10 @@ func (s *Server) Send(ctx context.Context,
 	if readOnlyMailbox(e.Rpc.Service, e.Rpc.Method) {
 		key += "/" + hex.EncodeToString(digest[:])
 	}
+
+	// Persist ingress before acknowledging it. Completed retries replay a
+	// cached response with the caller's current correlation ID; pending
+	// ones remain queued exactly once.
 	err = s.transact(ctx, func() error {
 		old := s.state.Requests[key]
 		if old != nil {
@@ -259,7 +282,12 @@ func readOnlyMailbox(service, method string) bool {
 }
 
 // enqueue assigns one monotonic sequence inside a state transition.
+// The caller must be inside transact. e is mutated to carry its assigned
+// sequence, and serialization or persistence failure must abort the transition.
 func (s *Server) enqueue(recipient string, e *mailboxpb.Envelope) error {
+	// Sequence allocation and envelope insertion share the state
+	// transaction so acknowledgement cursors never refer to an uncommitted
+	// message.
 	box := s.state.Mail[recipient]
 	if box == nil {
 		box = &mailbox{Next: 1, Messages: make(map[uint64][]byte)}
@@ -276,9 +304,13 @@ func (s *Server) enqueue(recipient string, e *mailboxpb.Envelope) error {
 }
 
 // emit schedules a typed push after the immediate RPC acknowledgement.
+// The caller must be inside transact; returning successfully stages the event
+// but does not make it visible until the enclosing snapshot has been saved.
 func (s *Server) emit(recipient, service, method string,
 	msg proto.Message) error {
 
+	// Stage protocol events separately from the direct RPC response. The
+	// transaction flushes these only after the response has been enqueued.
 	body, err := anypb.New(msg)
 	if err != nil {
 		return err
@@ -300,15 +332,24 @@ func (s *Server) emit(recipient, service, method string,
 }
 
 // Pull returns unacknowledged events with bounded, wakeable long polling.
+// Cursor is the first sequence to include; NextCursor follows the last
+// returned envelope and can be passed to AckUpTo. MaxEnvelopes defaults to 100
+// and is capped there; WaitTimeoutMs is capped at five seconds.
 func (s *Server) Pull(ctx context.Context,
 	req *mailboxpb.PullRequest) (*mailboxpb.PullResponse, error) {
 
+	// Mailbox contents are private to their key owner, including during
+	// long polling; authenticate before looking at cursors or pending
+	// events.
 	if err := authenticate(
 		ctx, req.MailboxId, req.MailboxId, nil,
 	); err != nil {
 
 		return nil, err
 	}
+
+	// Cap both wait time and page size so idle or backlogged clients cannot
+	// hold a request indefinitely or receive an unbounded response.
 	wait := min(
 		time.Duration(req.WaitTimeoutMs)*time.Millisecond, maxPullWait,
 	)
@@ -317,6 +358,10 @@ func (s *Server) Pull(ctx context.Context,
 	if limit == 0 || limit > maxMailboxBatch {
 		limit = maxMailboxBatch
 	}
+
+	// Read the current message set and wake channel under the same lock.
+	// A commit between lookup and waiting then closes the captured channel
+	// and cannot leave this pull asleep despite available messages.
 	for {
 		s.mu.Lock()
 		response := &mailboxpb.PullResponse{Status: &mailboxpb.Status{
@@ -357,6 +402,10 @@ func (s *Server) Pull(ctx context.Context,
 			)
 			return response, nil
 		}
+
+		// Cancellation terminates the RPC, timeout returns an empty
+		// page, and a committed-state wake triggers another lookup
+		// without resetting the deadline.
 		select {
 		case <-ctx.Done():
 			return nil, status.FromContextError(ctx.Err()).Err()
@@ -371,6 +420,9 @@ func (s *Server) Pull(ctx context.Context,
 
 // AckUpTo persists an exclusive acknowledgement watermark without allowing a
 // caller to discard future, undelivered events.
+// All envelopes with sequence less than Cursor are pruned atomically. A
+// cursor beyond the next assigned sequence is invalid; repeated or older
+// acknowledgements are harmless.
 func (s *Server) AckUpTo(ctx context.Context,
 	req *mailboxpb.AckUpToRequest) (*mailboxpb.AckUpToResponse, error) {
 
@@ -380,6 +432,9 @@ func (s *Server) AckUpTo(ctx context.Context,
 
 		return nil, err
 	}
+
+	// The cursor is exclusive and monotonic. Validate it before pruning so
+	// a typo cannot discard messages that have not even been assigned yet.
 	err := s.transact(ctx, func() error {
 		box := s.state.Mail[req.MailboxId]
 		if box == nil {
@@ -417,6 +472,9 @@ func (s *Server) AckUpTo(ctx context.Context,
 // dispatchPending executes admitted requests in arrival order. Domain handlers
 // run inside the same state transition as their response and pushed events.
 func (s *Server) dispatchPending(ctx context.Context) error {
+	// Recover admitted requests in ingress order rather than map order,
+	// bounding each pass so chain and settlement workers also make
+	// progress.
 	s.mu.Lock()
 	keys := make([]string, 0)
 	for key, req := range s.state.Requests {
@@ -428,6 +486,10 @@ func (s *Server) dispatchPending(ctx context.Context) error {
 		return s.state.Requests[keys[i]].Order < s.state.Requests[keys[j]].Order
 	})
 	s.mu.Unlock()
+
+	// Commit each handler's domain changes together with completion and its
+	// response; a crash cannot leave a successful operation eligible to run
+	// again.
 	for _, key := range keys[:min(len(keys), maxMailboxBatch)] {
 		err := s.transact(ctx, func() error {
 			req := s.state.Requests[key]
@@ -475,6 +537,10 @@ func (s *Server) dispatchPending(ctx context.Context) error {
 					e.Rpc.Method, "error", callErr,
 				)
 			}
+
+			// One-way protocol events have no RPC response.
+			// Translate failures into the domain events that the
+			// OOR and round client actors wait for.
 			if e.Rpc.Kind == mailboxpb.RpcMeta_KIND_EVENT {
 				req.Done = true
 				if callErr != nil && e.Rpc.Service == oorpb.ServiceName && e.Rpc.Method == oorpb.MethodSubmitPackage {
@@ -514,6 +580,10 @@ func (s *Server) dispatchPending(ctx context.Context) error {
 				}
 				return nil
 			}
+
+			// For ordinary RPCs, retain the correlated success or
+			// error even after mailbox pruning, allowing a semantic
+			// retry to recover its original outcome.
 			var body *anypb.Any
 			if result != nil && callErr == nil {
 				body, err = anypb.New(result)

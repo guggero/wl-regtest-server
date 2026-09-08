@@ -42,8 +42,11 @@ const (
 	maxReceiveParts = 64
 )
 
-// outSwap binds a virtual SCID to one authenticated receive intent and retains
-// every held circuit until a verified claim preimage resolves it.
+// outSwap tracks a Lightning-to-Ark receive from the wallet's perspective.
+// registered and collecting precede complete HTLC terms; awaiting-ack and
+// acknowledged separate receiver consent from treasury funding. Once funded,
+// the receive needs a verified claim or refund before becoming terminal.
+// Circuits retain the virtual SCID's held shards for reconnect recovery.
 type outSwap struct {
 	Request   *swaprpc.RequestChannelIdRequest
 	Response  *swaprpc.RequestChannelIdResponse
@@ -66,7 +69,12 @@ type outSwap struct {
 
 // RequestChannelId returns the funded node's virtual-hop route hint and binds
 // it to this payment hash. Credits are reserved only after account proof.
+// The request requires a signed account authorization, positive satoshis, a
+// 32-byte hash and expiry in seconds, at most one day. The interceptor must be
+// connected; exact retries return the original route and reservation.
 func (s *Server) RequestChannelId(ctx context.Context, req *swaprpc.RequestChannelIdRequest) (*swaprpc.RequestChannelIdResponse, error) {
+	// Authorize the receive terms and reserve any credit contribution in
+	// one transaction before exposing a route that can accept real HTLCs.
 	var response *swaprpc.RequestChannelIdResponse
 	err := s.transact(ctx, func() error {
 		account, digest, err := s.authorizeCredit(req)
@@ -89,6 +97,10 @@ func (s *Server) RequestChannelId(ctx context.Context, req *swaprpc.RequestChann
 			)
 		}
 		id := hex.EncodeToString(req.PaymentHash)
+
+		// A payment hash gets one route and immutable set of terms;
+		// retries recover that route without reserving the receiver's
+		// credits again.
 		old, err := get[outSwap](s, "out-swap/"+id)
 		if err != nil {
 			return err
@@ -103,6 +115,10 @@ func (s *Server) RequestChannelId(ctx context.Context, req *swaprpc.RequestChann
 			response = old.Response
 			return nil
 		}
+
+		// Below-minimum receives need attached credits to make a
+		// spendable vHTLC. Reserve only the difference, leaving the
+		// invoice amount unchanged.
 		a, err := s.account(account)
 		if err != nil {
 			return err
@@ -119,6 +135,10 @@ func (s *Server) RequestChannelId(ctx context.Context, req *swaprpc.RequestChann
 				)
 			}
 		}
+
+		// Derive a stable virtual SCID from the hash for restart
+		// recovery, while rejecting the unlikely collision rather than
+		// routing two intents to one ID.
 		hash := sha256.Sum256(append(
 			[]byte("wavelength-regtest/scid/"), req.PaymentHash...,
 		))
@@ -162,6 +182,10 @@ func (s *Server) RequestChannelId(ctx context.Context, req *swaprpc.RequestChann
 			Phase:    "registered",
 			Circuits: make(map[string]*routerrpc.ForwardHtlcInterceptRequest),
 		}
+
+		// Attached value remains reserved until claim or failure
+		// determines its ledger outcome; publishing the route does not
+		// yet debit the account.
 		if attached > 0 {
 			a.Reserved += attached
 			if err := s.put(
@@ -192,6 +216,8 @@ func (s *Server) RequestChannelId(ctx context.Context, req *swaprpc.RequestChann
 
 // emitSwap sends the explicit event wrapper to the receive-specific mailbox.
 func (s *Server) emitSwap(r *outSwap, event *swaprpc.SwapMailboxEvent) error {
+	// Use the payment-scoped mailbox so concurrent receives owned by one
+	// wallet reach the correct client actor.
 	pub, err := btcec.ParsePubKey(r.Request.ClientVhtlcPubkey)
 	if err != nil {
 		return err
@@ -217,7 +243,13 @@ func circuitID(key *routerrpc.CircuitKey) string {
 
 // acceptIntercept records an exact held shard before announcing complete
 // receive terms. Unrelated forwarding and final LND invoices resume normally.
+// A nil successful response means keep holding the shard. A non-nil response
+// is safe to send only after this call succeeds; on error the connection must
+// reconnect so LND can replay its durable hold.
 func (s *Server) acceptIntercept(ctx context.Context, req *routerrpc.ForwardHtlcInterceptRequest) (*routerrpc.ForwardHtlcInterceptResponse, error) {
+	// Default to normal forwarding for unrelated traffic. Once a virtual
+	// SCID is recognized, invalid terms fail rather than falling through to
+	// routing.
 	response := &routerrpc.ForwardHtlcInterceptResponse{
 		IncomingCircuitKey: req.IncomingCircuitKey,
 		Action:             routerrpc.ResolveHoldForwardAction_RESUME,
@@ -244,6 +276,10 @@ func (s *Server) acceptIntercept(ctx context.Context, req *routerrpc.ForwardHtlc
 
 			return nil
 		}
+
+		// LND replays held circuits after reconnect. Accept only the
+		// identical shard and return a saved terminal result instead of
+		// counting its value twice.
 		cid := circuitID(req.IncomingCircuitKey)
 		if old := r.Circuits[cid]; old != nil {
 			if !proto.Equal(old, req) {
@@ -265,6 +301,10 @@ func (s *Server) acceptIntercept(ctx context.Context, req *routerrpc.ForwardHtlc
 			response = nil
 			return nil
 		}
+
+		// New shards are admitted only while collecting the original
+		// payment, with enough expiry runway and a bounded number of
+		// held circuits.
 		if r.Phase != "registered" && r.Phase != "collecting" {
 			return nil
 		}
@@ -276,6 +316,10 @@ func (s *Server) acceptIntercept(ctx context.Context, req *routerrpc.ForwardHtlc
 
 			return nil
 		}
+
+		// Funding is based on the exact total across distinct shards.
+		// Refuse overpayment here rather than silently changing the
+		// negotiated receive amount.
 		var sum uint64
 		for _, part := range r.Circuits {
 			sum += part.OutgoingAmountMsat
@@ -287,6 +331,9 @@ func (s *Server) acceptIntercept(ctx context.Context, req *routerrpc.ForwardHtlc
 		r.Circuits[cid] = req
 		r.Phase = "collecting"
 		if sum == r.Request.AmountSat*1000 {
+			// The shortest shard or auto-fail deadline bounds the
+			// entire receive. Place the Ark refund earlier so
+			// treasury recovery retains a safety margin.
 			deadline := req.IncomingExpiry
 			for _, part := range r.Circuits {
 				deadline = min(deadline, part.IncomingExpiry)
@@ -301,6 +348,10 @@ func (s *Server) acceptIntercept(ctx context.Context, req *routerrpc.ForwardHtlc
 					"receive claim window too short",
 				)
 			}
+
+			// Only a complete held payment gets final vHTLC terms.
+			// The receiver must inspect its onions and acknowledge
+			// those terms before treasury funding.
 			sender := s.deriveKey("swap-sender/" + *id)
 			receiver, err := btcec.ParsePubKey(
 				r.Request.ClientVhtlcPubkey,
@@ -334,6 +385,10 @@ func (s *Server) acceptIntercept(ctx context.Context, req *routerrpc.ForwardHtlc
 			}
 			event := &swaprpc.OutSwapHtlcEvent{PaymentHash: r.Request.PaymentHash, AmountSat: r.Response.VhtlcAmountSat, VhtlcConfig: r.Config,
 				RequestedAmountSat: r.Request.AmountSat, AttachedCreditSat: r.Response.AttachedCreditSat}
+
+			// Present shards in deterministic circuit order so
+			// replayed terms retain the same onion and amount
+			// sequence.
 			ids := make([]string, 0, len(r.Circuits))
 			for id := range r.Circuits {
 				ids = append(ids, id)
@@ -366,8 +421,13 @@ func (s *Server) acceptIntercept(ctx context.Context, req *routerrpc.ForwardHtlc
 }
 
 // AcknowledgeOutSwapHtlc accepts only the receiver's signature over the exact
-// persisted policy and amount, before any treasury funding is signed.
+// persisted policy and amount, before any treasury funding is signed. Success
+// records consent but does not guarantee funding. The worker also requires live
+// held circuits and enough remaining time before issuing the vHTLC.
 func (s *Server) AcknowledgeOutSwapHtlc(ctx context.Context, req *swaprpc.AcknowledgeOutSwapHtlcRequest) (*swaprpc.AcknowledgeOutSwapHtlcResponse, error) {
+	// Bind consent to the saved receiver, payment hash, combined amount,
+	// and script; a generic acknowledgement must not authorize different
+	// funding terms.
 	err := s.transact(ctx, func() error {
 		if len(
 			req.PaymentHash,
@@ -417,6 +477,9 @@ func (s *Server) AcknowledgeOutSwapHtlc(ctx context.Context, req *swaprpc.Acknow
 				"invalid receive acknowledgement",
 			)
 		}
+
+		// A valid late signature cannot revive an expired receive.
+		// Exact acknowledgements after funding remain harmless retries.
 		if r.Phase == "failed" {
 			return status.Error(
 				codes.FailedPrecondition, "receive expired",
@@ -436,9 +499,13 @@ func (s *Server) AcknowledgeOutSwapHtlc(ctx context.Context, req *swaprpc.Acknow
 
 // observedPreimage extracts a matching preimage from a script-verified OOR
 // spend or a Bitcoin-validated on-chain spend of the exact HTLC outpoint.
+// The caller must hold s.mu. No matching verified disclosure returns nil, nil;
+// malformed saved recovery data returns an error rather than a guessed outcome.
 func (s *Server) observedPreimage(outpoint string, hash []byte) ([]byte,
 	error) {
 
+	// Prefer a durable chain disclosure, which remains usable even after
+	// a reorg removes the transaction that first revealed it.
 	disclosed, err := get[chainClaim](s, "chain-claim/"+outpoint)
 	if err != nil {
 		return nil, err
@@ -449,6 +516,10 @@ func (s *Server) observedPreimage(outpoint string, hash []byte) ([]byte,
 			return disclosed.Preimage, nil
 		}
 	}
+
+	// Off-chain disclosure counts only when this indexed output was spent
+	// by a finalized session; a submitted but incomplete checkpoint is
+	// insufficient.
 	coin, err := get[vtxoRecord](s, "vtxo/"+outpoint)
 	if err != nil || coin == nil {
 		return nil, err
@@ -466,6 +537,9 @@ func (s *Server) observedPreimage(outpoint string, hash []byte) ([]byte,
 	if r == nil || len(r.Final) == 0 {
 		return nil, nil
 	}
+
+	// Inspect the exact funding input and execute its completed witness
+	// before accepting any 32-byte item as the settlement preimage.
 	for _, raw := range r.Final[0].CheckpointPsbts {
 		packet, err := psbtutil.Parse(raw)
 		if err != nil {
@@ -496,10 +570,16 @@ func (s *Server) observedPreimage(outpoint string, hash []byte) ([]byte,
 
 // reconcileReceives funds acknowledged live circuits and releases their real
 // Lightning preimage only after the client's checkpoint is fully finalized.
+// active is the connection-owned set of replayed circuit IDs; internal
+// receives do not require LND circuits. Callers must discard responses on error
+// and send them only after successful persistence.
 func (s *Server) reconcileReceives(ctx context.Context,
 	active map[string]bool) ([]*routerrpc.ForwardHtlcInterceptResponse,
 	error) {
 
+	// Accumulate stream responses inside the state transaction, but send
+	// them only after it commits; LND settlement must not outrun durable
+	// claim state.
 	var responses []*routerrpc.ForwardHtlcInterceptResponse
 	err := s.transact(ctx, func() error {
 		for key := range s.state.Records {
@@ -510,10 +590,18 @@ func (s *Server) reconcileReceives(ctx context.Context,
 			if err != nil {
 				return err
 			}
+
+			// After reconnect, only replayed circuits are known to
+			// remain held. Require all shards before risking
+			// treasury funding for an external receive.
 			allActive := r.Internal || len(r.Circuits) > 0
 			for id := range r.Circuits {
 				allActive = allActive && active[id]
 			}
+
+			// Before funding, expiry can safely cancel the offer
+			// and release its credits. Funded outputs instead need
+			// claim or refund reconciliation.
 			if r.Phase == "registered" || r.Phase == "collecting" ||
 				r.Phase == "awaiting-ack" ||
 				r.Phase == "acknowledged" {
@@ -526,6 +614,10 @@ func (s *Server) reconcileReceives(ctx context.Context,
 					r.Phase = "failed"
 				}
 			}
+
+			// Receiver consent and sufficient remaining claim time
+			// gate the real treasury OOR transfer; signing terms
+			// alone does not issue a balance.
 			if r.Phase == "acknowledged" && allActive {
 				if r.Config.RefundLocktime <= s.height+100 {
 					r.Phase = "failed"
@@ -542,6 +634,10 @@ func (s *Server) reconcileReceives(ctx context.Context,
 					r.Phase = "funded"
 				}
 			}
+
+			// Settle only after verified off-chain or on-chain
+			// disclosure proves that the receiver has exercised the
+			// funded hashlock.
 			if r.Phase == "funded" {
 				r.Preimage, err = s.observedPreimage(
 					r.Outpoint, r.Request.PaymentHash,
@@ -575,6 +671,10 @@ func (s *Server) reconcileReceives(ctx context.Context,
 					}
 				}
 			}
+
+			// Without a claim, recover treasury-owned funding after
+			// the agreed absolute refund height. A direct same-Ark
+			// sender owns its own refund instead.
 			if r.Phase == "funded" && r.Config != nil &&
 				r.Config.RefundLocktime <= s.height &&
 				len(r.Preimage) == 0 &&
@@ -626,6 +726,10 @@ func (s *Server) reconcileReceives(ctx context.Context,
 					return err
 				}
 			}
+
+			// Resolve only circuits replayed on this connection.
+			// Saved terminal state handles any remaining shards
+			// when LND presents them again.
 			if r.Phase == "completed" || r.Phase == "failed" {
 				for id, part := range r.Circuits {
 					if !active[id] {
@@ -659,6 +763,10 @@ func (s *Server) reconcileReceives(ctx context.Context,
 // connection owns a receiver goroutine and waits for it before reconnecting.
 func (s *Server) runInterceptor() {
 	defer s.wg.Done()
+
+	// A failed stream loses readiness immediately; reconnect after a
+	// bounded pause while preserving held-circuit decisions in durable
+	// state.
 	for {
 		if s.ctx.Err() != nil {
 			return
@@ -685,12 +793,17 @@ func (s *Server) runInterceptor() {
 // interceptConnection serializes stream sends and reconciles held circuit
 // state while a separately canceled receiver waits for new LND requests.
 func (s *Server) interceptConnection(ctx context.Context) error {
+	// Give the receiver a connection-scoped cancellation path so reconnect
+	// never leaves an old goroutine blocked on a defunct stream.
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	stream, err := s.cfg.LND.Router.HtlcInterceptor(ctx)
 	if err != nil {
 		return err
 	}
+
+	// One goroutine receives while this function owns all sends. Buffered
+	// error delivery lets the receiver exit even during reconciliation.
 	requests := make(chan *routerrpc.ForwardHtlcInterceptRequest)
 	errorsCh := make(chan error, 1)
 	done := make(chan struct{})
@@ -714,6 +827,10 @@ func (s *Server) interceptConnection(ctx context.Context) error {
 	s.mu.Lock()
 	s.interceptorReady = true
 	s.mu.Unlock()
+
+	// Track only circuits actually presented on this stream; durable
+	// records alone do not prove that LND is still holding them after
+	// reconnect.
 	active := make(map[string]bool)
 	for {
 		select {
@@ -724,6 +841,9 @@ func (s *Server) interceptConnection(ctx context.Context) error {
 			return err
 
 		case req := <-requests:
+			// Persist new holds before adding them to the active
+			// set. Immediate resume/fail/replayed-settle responses
+			// need no pending funding work.
 			response, err := s.acceptIntercept(ctx, req)
 			if err != nil {
 				return err
@@ -737,6 +857,9 @@ func (s *Server) interceptConnection(ctx context.Context) error {
 			}
 
 		case <-s.cfg.Clock.TickAfter(workerInterval):
+			// Commit funding and settlement decisions before
+			// sending resolutions. A send failure is recovered by
+			// LND replaying the same held circuit.
 			responses, err := s.reconcileReceives(ctx, active)
 			if err != nil {
 				s.cfg.Log.Debug(

@@ -66,10 +66,17 @@ type Coin struct {
 	Confirmations int64
 }
 
-// Call performs one JSON-RPC request and preserves node errors for diagnostics.
+// Call executes one authenticated JSON-RPC request within RPCTimeout. If result
+// is non-nil it must accept JSON unmarshaling, normally via a pointer. Node
+// failures retain their numeric RPCError code so recovery can distinguish a
+// missing transaction from transport failure; a nil result discards success
+// data.
 func (b *Bitcoin) Call(ctx context.Context, method string, params any,
 	result any) error {
 
+	// Construct the complete request before opening a connection.
+	// Serialization errors must not be mistaken for an ambiguous backend
+	// operation.
 	body, err := json.Marshal(map[string]any{
 		"jsonrpc": "1.0", "id": "wl-regtest", "method": method,
 		"params": params,
@@ -77,6 +84,10 @@ func (b *Bitcoin) Call(ctx context.Context, method string, params any,
 	if err != nil {
 		return err
 	}
+
+	// A stalled node must not hold a protocol transition indefinitely. The
+	// child deadline also honors an earlier caller deadline or
+	// cancellation.
 	ctx, cancel := context.WithTimeout(ctx, RPCTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(
@@ -96,6 +107,10 @@ func (b *Bitcoin) Call(ctx context.Context, method string, params any,
 		return fmt.Errorf("bitcoin %s: %w", method, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+
+	// Core can return structured RPC errors with a non-200 HTTP status.
+	// Decode the bounded envelope first so callers retain the actionable
+	// node error.
 	var envelope struct {
 		Result json.RawMessage `json:"result"`
 		Error  *struct {
@@ -120,6 +135,9 @@ func (b *Bitcoin) Call(ctx context.Context, method string, params any,
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("bitcoin %s HTTP %d", method, resp.StatusCode)
 	}
+
+	// Some operations need only acknowledgement. Decode result data only
+	// when the caller has supplied a destination for it.
 	if result == nil {
 		return nil
 	}
@@ -135,10 +153,16 @@ func (b *Bitcoin) Info(ctx context.Context) (*ChainInfo, error) {
 	return &info, nil
 }
 
-// UTXO checks an outpoint against the node's current UTXO set and mempool.
+// UTXO reads an outpoint from Core, including mempool spends. It returns
+// ErrOutputSpent when Core reports no coin; this can also mean the creating
+// transaction is unknown or disconnected, so callers must resolve that context.
+// Output values are returned in satoshis and confirmations may be zero.
 func (b *Bitcoin) UTXO(ctx context.Context, outpoint wire.OutPoint) (*Coin,
 	error) {
 
+	// Use a pointer to distinguish a JSON null from an output with
+	// zero-valued fields. Including the mempool prevents reuse of a coin
+	// already being spent.
 	var result *struct {
 		Value         float64 `json:"value"`
 		Confirmations int64   `json:"confirmations"`
@@ -155,6 +179,10 @@ func (b *Bitcoin) UTXO(ctx context.Context, outpoint wire.OutPoint) (*Coin,
 	if result == nil {
 		return nil, fmt.Errorf("outpoint %s: %w", outpoint, ErrOutputSpent)
 	}
+
+	// Core reports BTC as a decimal amount and the script as hex. Convert
+	// both at this boundary so transaction builders only handle satoshis
+	// and bytes.
 	value, err := btcutil.NewAmount(result.Value)
 	if err != nil {
 		return nil, err
@@ -174,6 +202,10 @@ func (b *Bitcoin) Publish(ctx context.Context, raw []byte) error {
 	err := b.Call(ctx, "sendrawtransaction", []any{
 		hex.EncodeToString(raw), 0,
 	}, &id)
+
+	// A persisted broadcast can be retried after a crash or a lost RPC
+	// reply. Already-confirmed transactions satisfy the same publication
+	// obligation.
 	if err != nil &&
 		strings.Contains(err.Error(), "already in block chain") {
 
@@ -209,6 +241,10 @@ func (b *Bitcoin) BlockHeight(ctx context.Context, hash string) (uint32,
 
 		return 0, err
 	}
+
+	// A header remains queryable after a reorg. Reject a disconnected
+	// header rather than treating its height as proof of current
+	// confirmation.
 	if header.Confirmations < 0 {
 		return 0, errors.New("block is no longer canonical")
 	}

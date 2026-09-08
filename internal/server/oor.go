@@ -24,7 +24,10 @@ import (
 )
 
 // oorRecord retains the immutable submit transcript and complete finalized
-// recovery package. Input locks remain held once co-signatures are exposed.
+// recovery package. Success means operator cosignatures are available; Final
+// means the client completed checkpoint signatures and outputs were indexed.
+// Input locks remain held once cosignatures are exposed, including when the
+// client never finishes finalization.
 type oorRecord struct {
 	RoundID   string
 	Owner     string
@@ -44,6 +47,10 @@ func oorKey(id chainhash.Hash) string { return "oor/" + id.String() }
 // registerOOR binds generated package RPCs and the public client's TLV receipt.
 func (s *Server) registerOOR() {
 	oorpb.RegisterOORMailboxServiceMailboxServer(s.router, s)
+
+	// The public client encodes receipts as a typed TLV payload rather than
+	// a generated RPC message; validate the type and session before
+	// authorizing it.
 	s.router.Handle(
 		oorpb.ServiceName, oorpb.MethodIncomingAck,
 		func() proto.Message { return &anypb.Any{} },
@@ -77,6 +84,10 @@ func (s *Server) registerOOR() {
 					"invalid OOR receipt session",
 				)
 			}
+
+			// Only a registered recipient of a finalized session
+			// can acknowledge delivery; a sender or unrelated
+			// mailbox cannot unlock receive settlement.
 			r, err := get[oorRecord](s, oorKey(*id))
 			if err != nil {
 				return nil, err
@@ -101,9 +112,13 @@ func (s *Server) registerOOR() {
 
 // SubmitPackage validates and co-signs a real OOR package, retaining its exact
 // recovery artifacts and input reservations before returning any signatures.
+// The authenticated mailbox dispatcher supplies the enclosing transaction.
+// An exact retry replays signatures; conflicting ownership or metadata fails.
 func (s *Server) SubmitPackage(ctx context.Context,
 	req *oorpb.SubmitPackageRequest) (*oorpb.SubmitPackageResponse, error) {
 
+	// Accept only the supported package flow before parsing and deriving
+	// the transaction ID used for durable session identity.
 	if req.GetFlowVersion() != 0 {
 		return nil, status.Error(
 			codes.InvalidArgument, "unsupported OOR flow",
@@ -114,6 +129,9 @@ func (s *Server) SubmitPackage(ctx context.Context,
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 	id := ark.UnsignedTx.TxHash()
+
+	// An identical transaction ID is not enough for a retry: owner and all
+	// request metadata must match the transcript whose signatures escaped.
 	old, err := get[oorRecord](s, oorKey(id))
 	if err != nil {
 		return nil, err
@@ -136,6 +154,9 @@ func (s *Server) SubmitPackage(ctx context.Context,
 			oorpb.MethodSubmitPackage, response,
 		)
 	}
+
+	// Check public structure, indexed policy, and current chain maturity
+	// before creating any operator signature or input reservation.
 	inputs, err := s.validateOOR(ark, checkpoints, descriptors, recipients)
 	if err == nil {
 		err = s.validateOORChain(ctx, inputs)
@@ -150,6 +171,10 @@ func (s *Server) SubmitPackage(ctx context.Context,
 			oorpb.MethodSubmitPackage, response,
 		)
 	}
+
+	// Retain all recovery dependencies before cosigning. A recipient must
+	// be able to exit through every ancestral commitment backing these
+	// inputs.
 	r := &oorRecord{
 		Owner: principal(
 			ctx,
@@ -178,6 +203,10 @@ func (s *Server) SubmitPackage(ctx context.Context,
 
 		return nil, status.Error(codes.PermissionDenied, err.Error())
 	}
+
+	// Once the Ark stage verifies, cosign its funding checkpoints and
+	// reserve the original VTXOs in the same transaction as the response
+	// transcript.
 	for _, input := range inputs {
 		if err := signPacketInput(
 			input.Packet, 0, s.key, input.Spend,
@@ -212,10 +241,15 @@ func (s *Server) SubmitPackage(ctx context.Context,
 
 // FinalizePackage verifies checkpoint signatures against the original prevouts
 // and atomically consumes inputs, creates outputs and queues recipient events.
+// The dispatcher supplies the transaction. The caller must own the session
+// and submit final checkpoints matching the saved submission; replay does not
+// create another set of outputs or events.
 func (s *Server) FinalizePackage(ctx context.Context,
 	req *oorpb.FinalizePackageRequest) (*oorpb.FinalizePackageResponse,
 	error) {
 
+	// Finalization belongs to the mailbox that submitted the original
+	// package, and must refer to its saved operator signatures.
 	id, checkpoints, err := oorpb.ParseFinalizePackageRequest(req)
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
@@ -233,6 +267,9 @@ func (s *Server) FinalizePackage(ctx context.Context,
 	if err != nil {
 		return nil, err
 	}
+
+	// Final client signatures may complete witnesses, but may not replace
+	// checkpoint transactions or their authoritative prevout metadata.
 	previous := make(map[chainhash.Hash]*psbt.Packet)
 	for _, raw := range r.Success.CoSignedCheckpointPsbts {
 		packet, err := psbtutil.Parse(raw)
@@ -262,6 +299,9 @@ func (s *Server) FinalizePackage(ctx context.Context,
 
 		return nil, status.Error(codes.PermissionDenied, err.Error())
 	}
+
+	// Revalidate retries before replaying success, then index a new session
+	// only once so balances and recipient event IDs cannot be duplicated.
 	response := oorpb.NewFinalizePackageResponse(id)
 	if len(r.Final) > 0 {
 		return response, s.emit(
@@ -286,9 +326,14 @@ func (s *Server) FinalizePackage(ctx context.Context,
 
 // oorLineage unions signed tree fragments and orders complete ancestor packages
 // before descendants, retaining all roots for cross-commitment transfers.
+// The caller must hold s.mu and pass validated input bindings. r is populated
+// in place; a missing finalized parent or depth above 32 rejects the package.
 func (s *Server) oorLineage(r *oorRecord, ark *psbt.Packet,
 	inputs map[chainhash.Hash]*oorInput) error {
 
+	// Union dependencies across inputs while retaining the earliest expiry
+	// and greatest depth; a merge cannot extend any backing commitment's
+	// life.
 	paths := make(map[string]*arkrpc.AncestryPath)
 	packages := make(map[string]bool)
 	for i, input := range ark.UnsignedTx.TxIn {
@@ -305,6 +350,10 @@ func (s *Server) oorLineage(r *oorRecord, ark *psbt.Packet,
 				"OOR lineage exceeds regtest depth limit",
 			)
 		}
+
+		// Ancestors must already be finalized and precede descendants
+		// in the recovery package. Deduplicate shared parents without
+		// losing that order.
 		if len(v.OorArkPsbt) > 0 {
 			parentID, err := chainhash.NewHash(v.Outpoint.Txid)
 			if err != nil {
@@ -329,6 +378,10 @@ func (s *Server) oorLineage(r *oorRecord, ark *psbt.Packet,
 				r.Ancestors = append(r.Ancestors, pkg)
 			}
 		}
+
+		// Inputs may share a commitment but need different signed
+		// branches. Merge those fragments and record which new input
+		// each root supports.
 		for _, path := range v.AncestryPaths {
 			key := string(path.CommitmentTxid)
 			current := paths[key]
@@ -349,6 +402,9 @@ func (s *Server) oorLineage(r *oorRecord, ark *psbt.Packet,
 			)
 		}
 	}
+
+	// Canonical root ordering makes persisted lineage independent of Go map
+	// iteration, simplifying replay and comparison of recovery artifacts.
 	for _, path := range paths {
 		r.Paths = append(r.Paths, path)
 	}
@@ -361,7 +417,11 @@ func (s *Server) oorLineage(r *oorRecord, ark *psbt.Packet,
 }
 
 // mergeAncestry combines branches with the same signed commitment root.
+// destination is mutated; callers must discard it on error. source must refer
+// to the same root, and any shared node must have identical signed bytes.
 func mergeAncestry(destination, source *arkrpc.AncestryPath) error {
+	// Decode both fragments and require the same funding outpoint before
+	// combining branches into the destination's recovery proof.
 	dst, err := arkrpc.AncestryPathToTree(destination)
 	if err != nil {
 		return err
@@ -376,6 +436,9 @@ func mergeAncestry(destination, source *arkrpc.AncestryPath) error {
 	if err := mergeNodes(dst.Root, src.Root); err != nil {
 		return err
 	}
+
+	// Re-encode derived depth and tree metadata together so adding a branch
+	// cannot leave the serialized ancestry description stale.
 	merged, err := arkrpc.AncestryPathFromTree(
 		dst, dst.BatchOutpoint.Hash, destination.InputIndices,
 	)
@@ -387,7 +450,11 @@ func mergeAncestry(destination, source *arkrpc.AncestryPath) error {
 }
 
 // mergeNodes adds signed branches without accepting inconsistent transactions.
+// The destination tree is mutated and may share newly attached source nodes.
+// Callers must provide exclusive access and discard partial results on error.
 func mergeNodes(destination, source *tree.Node) error {
+	// Compare witness hashes, not just txids: both fragments must agree on
+	// the signatures that make their common node independently spendable.
 	dst, err := destination.ToSignedTx()
 	if err != nil {
 		return err
@@ -399,6 +466,10 @@ func mergeNodes(destination, source *tree.Node) error {
 	if dst.WitnessHash() != src.WitnessHash() {
 		return errors.New("inconsistent signed ancestry")
 	}
+
+	// Recurse through shared branches to detect disagreement; attach
+	// missing branches only after their common parent has been proven
+	// identical.
 	for index, child := range source.Children {
 		if existing := destination.Children[index]; existing != nil {
 			if err := mergeNodes(existing, child); err != nil {
@@ -415,9 +486,14 @@ func mergeNodes(destination, source *tree.Node) error {
 }
 
 // indexOOR records spent inputs and complete signed output recovery metadata.
+// The caller must commit the finalized session, record updates, and pending
+// notifications in one transaction; r.Final must already contain signed
+// checkpoints.
 func (s *Server) indexOOR(r *oorRecord, id chainhash.Hash,
 	ark *psbt.Packet) error {
 
+	// Consume originals in the same transaction that creates replacements
+	// and events, so recipients never observe newly issued value twice.
 	for _, input := range r.Inputs {
 		record, err := get[vtxoRecord](s, "vtxo/"+input)
 		if err != nil || record == nil {
@@ -433,6 +509,9 @@ func (s *Server) indexOOR(r *oorRecord, id chainhash.Hash,
 			return err
 		}
 	}
+
+	// Materialize the verified signed leaf for unilateral recovery before
+	// constructing the recipient records that expose it.
 	tx, err := signedPacket(ark)
 	if err != nil {
 		return err
@@ -441,6 +520,9 @@ func (s *Server) indexOOR(r *oorRecord, id chainhash.Hash,
 	if err := tx.Serialize(&raw); err != nil {
 		return err
 	}
+
+	// Each recipient receives the complete checkpoint package and shared
+	// ancestry needed to recover without any later operator cooperation.
 	for i, recipient := range r.Request.RecipientOutputs {
 		outpoint := wire.OutPoint{Hash: id, Index: uint32(i)}
 		v := &arkrpc.VTXO{Outpoint: &arkrpc.OutPoint{
@@ -496,6 +578,9 @@ func (s *Server) notifyOOR(event *arkrpc.OORRecipientEvent) error {
 		RecipientEventId:  event.EventId, SessionId: event.SessionId,
 		OutputIndex: event.OutputIndex, Value: event.Value,
 	}
+
+	// Only live script registrations receive hints. The hint is not a grant
+	// to fetch another recipient's proof-gated recovery package.
 	for key := range s.state.Records {
 		if !strings.HasPrefix(key, "script/") {
 			continue

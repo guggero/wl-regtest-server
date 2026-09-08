@@ -37,9 +37,15 @@ func env(name, fallback string) string {
 	return fallback
 }
 
-// openWallet starts the pinned, unmodified upstream SDK against regtest.
+// openWallet starts the pinned upstream SDK with an independent random seed
+// and temporary data directory against the configured regtest services. It
+// registers wallet shutdown with t and uses ctx for startup and client work.
 func openWallet(t *testing.T, ctx context.Context) *wavewalletdk.Client {
 	t.Helper()
+
+	// Independent seeds ensure transfers cross real ownership boundaries,
+	// while the shared operator and indexer exercise public network
+	// interfaces.
 	entropy := make([]byte, 16)
 	_, err := rand.Read(entropy)
 	require.NoError(t, err)
@@ -73,6 +79,9 @@ func TestUpstreamClient(t *testing.T) {
 
 		t.Skip("set WL_INTEGRATION=1 with a funded regtest stack")
 	}
+
+	// Bound the complete external-service scenario and verify regtest
+	// before spending wallet funds or mining blocks.
 	ctx, cancel := context.WithTimeout(t.Context(), integrationTimeout)
 	defer cancel()
 	bitcoin := &backend.Bitcoin{
@@ -95,6 +104,9 @@ func TestUpstreamClient(t *testing.T) {
 			1, miningAddress,
 		}, nil) == nil
 	}
+
+	// Board only Alice on-chain; Bob starts empty so his first invoice
+	// receipt must also perform Lightning onboarding.
 	alice, bob := openWallet(t, ctx), openWallet(t, ctx)
 	deposit, err := alice.Deposit(ctx, wavewalletdk.DepositRequest{
 		AmountSatHint: 200000,
@@ -112,6 +124,9 @@ func TestUpstreamClient(t *testing.T) {
 		balance, err := alice.Balance(ctx)
 		return err == nil && balance.ConfirmedSat == 200000
 	}, convergenceTimeout, pollInterval)
+
+	// Exercise the public invoice flow between two wallets and wait for
+	// Bob's indexed spendable balance, not merely the RPC acknowledgement.
 	invoice, err := bob.SwapRPC().StartReceive(
 		ctx, &swapclientrpc.StartReceiveRequest{
 			AmountSat: 50000,
@@ -126,6 +141,9 @@ func TestUpstreamClient(t *testing.T) {
 		balance, err := bob.Balance(ctx)
 		return err == nil && balance.ConfirmedSat == 50000
 	}, convergenceTimeout, pollInterval)
+
+	// Add a separate direct OOR transfer to prove recipient registration
+	// and recovery indexing work after invoice onboarding.
 	receive, err := bob.ArkRPC().NewReceiveScript(
 		ctx, &waverpc.NewReceiveScriptRequest{
 			IdempotencyKey: "upstream-receive",
@@ -147,6 +165,10 @@ func TestUpstreamClient(t *testing.T) {
 		balance, err := bob.Balance(ctx)
 		return err == nil && balance.ConfirmedSat == 70000
 	}, convergenceTimeout, pollInterval)
+
+	// Exit an actually received VTXO collaboratively and verify its value
+	// appears as a confirmed Bitcoin output, beyond the SDK's reported exit
+	// path.
 	inventory, err := bob.List(ctx, wavewalletdk.ListRequest{
 		View: wavewalletdk.ListViewVTXOs,
 	})

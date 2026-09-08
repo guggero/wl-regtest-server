@@ -14,6 +14,8 @@ import (
 // TestChainReconciliation exercises authoritative reorg and unilateral-spend
 // observations while preserving already-consumed VTXOs across reconfirmation.
 func TestChainReconciliation(t *testing.T) {
+	// Model confirmed, disconnected, and spent roots through RPC responses
+	// so the test exercises reconciliation without needing a live chain.
 	var state atomic.Int32
 	node := httptest.NewServer(http.HandlerFunc(
 		func(w http.ResponseWriter, r *http.Request) {
@@ -66,6 +68,10 @@ func TestChainReconciliation(t *testing.T) {
 		},
 	))
 	defer node.Close()
+
+	// Index two coins sharing the root but with different protocol states;
+	// chain changes may affect the live coin without reviving the spent
+	// one.
 	s := testServer(t, t.TempDir())
 	s.cfg.Bitcoin.URL = node.URL
 	record := &vtxoRecord{VTXO: &arkrpc.VTXO{
@@ -82,6 +88,10 @@ func TestChainReconciliation(t *testing.T) {
 		record.VTXO.Status = arkrpc.VTXOStatus_VTXO_STATUS_SPENT
 		return s.recordVTXO("vtxo/spent", record, 0)
 	}))
+
+	// Move the same records through reorg and unroll transitions to verify
+	// recovery in both directions, rather than testing only fresh
+	// snapshots.
 	for _, test := range []struct {
 		name   string
 		chain  int32
@@ -99,12 +109,19 @@ func TestChainReconciliation(t *testing.T) {
 			live, err := get[vtxoRecord](s, "vtxo/live")
 			require.NoError(t, err)
 			require.Equal(t, test.status, live.VTXO.Status)
+
+			// A protocol-consumed input stays spent regardless of
+			// root visibility.
 			spent, err := get[vtxoRecord](s, "vtxo/spent")
 			require.NoError(t, err)
 			require.Equal(
 				t, arkrpc.VTXOStatus_VTXO_STATUS_SPENT,
 				spent.VTXO.Status,
 			)
+
+			// Repeated observation of the same state must not
+			// create another event that a recovering wallet could
+			// mistake for new activity.
 			before := live.EventID
 			require.NoError(t, s.pollVTXOChain(t.Context()))
 			live, err = get[vtxoRecord](s, "vtxo/live")

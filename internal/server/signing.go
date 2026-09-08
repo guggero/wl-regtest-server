@@ -27,13 +27,18 @@ type nodeSigning struct {
 	Signature     []byte
 }
 
-// newNodeSigning creates an independent nonce for a single transaction digest.
+// newNodeSigning creates an independent nonce for one 32-byte transaction
+// digest. The caller must persist the returned secret before exposing its
+// public nonce, and must use it only with that digest and signing key.
 func newNodeSigning(key *btcec.PrivateKey, digest []byte) (*nodeSigning,
 	error) {
 
 	if len(digest) != 32 {
 		return nil, errors.New("invalid tree signature digest")
 	}
+
+	// Mix the signing key and message into fresh nonce generation so each
+	// node has an independent signing session, including across restarts.
 	nonce, err := musig2.GenNonces(
 		musig2.WithPublicKey(key.PubKey()),
 		musig2.WithNonceSecretKeyAux(key),
@@ -47,10 +52,14 @@ func newNodeSigning(key *btcec.PrivateKey, digest []byte) (*nodeSigning,
 }
 
 // bindNonces binds all peer nonces before producing the operator partial. A
-// different peer transcript is never accepted after the first binding.
+// different peer transcript is never accepted after the first binding. The
+// caller must serialize access and persist this mutation before releasing the
+// partial; root is the Taproot script root, or empty for a BIP86 output.
 func (n *nodeSigning) bindNonces(key *btcec.PrivateKey, node *tree.Node,
 	digest, root []byte, peers map[string][]byte) error {
 
+	// Retries may return the original partial, but must never reuse its
+	// secret nonce with a different aggregate nonce.
 	if len(n.Partial) > 0 {
 		if len(peers) != len(n.Peers) {
 			return errors.New("nonce transcript changed")
@@ -62,6 +71,9 @@ func (n *nodeSigning) bindNonces(key *btcec.PrivateKey, node *tree.Node,
 		}
 		return nil
 	}
+
+	// Require exactly the tree participants before aggregation. An omitted
+	// or additional peer would change the signing session.
 	nonces := [][musig2.PubNonceSize]byte{
 		[musig2.PubNonceSize]byte(n.Public),
 	}
@@ -79,6 +91,9 @@ func (n *nodeSigning) bindNonces(key *btcec.PrivateKey, node *tree.Node,
 	if len(peers) != len(nonces)-1 || len(n.Secret) != musig2.SecNonceSize {
 		return errors.New("invalid nonce transcript")
 	}
+
+	// The key ordering and tweak must match the tree output construction;
+	// an untweaked signature would not spend that output.
 	aggregate, err := musig2.AggregateNonces(nonces)
 	if err != nil {
 		return fmt.Errorf("aggregate tree nonces: %w", err)
@@ -96,6 +111,10 @@ func (n *nodeSigning) bindNonces(key *btcec.PrivateKey, node *tree.Node,
 	if err != nil {
 		return fmt.Errorf("sign tree node: %w", err)
 	}
+
+	// Replace the secret with the reproducible public transcript.
+	// Persisting this transition makes retries return the same partial
+	// without signing again.
 	var encoded bytes.Buffer
 	if err := partial.Encode(&encoded); err != nil {
 		return err
@@ -109,10 +128,15 @@ func (n *nodeSigning) bindNonces(key *btcec.PrivateKey, node *tree.Node,
 
 // combine verifies every peer partial against its committed public nonce and
 // verifies the resulting Schnorr signature against the actual tree output key.
+// The caller must pass the same key, node, 32-byte digest and script root used
+// for binding, serialize access, and persist the resulting signature before
+// publishing it. Empty root selects the BIP86 tweak.
 func (n *nodeSigning) combine(key *btcec.PublicKey, node *tree.Node,
 	digest, root []byte, peers map[string][]byte) (*schnorr.Signature,
 	error) {
 
+	// Combination is allowed only after our nonce transcript is fixed; peer
+	// partials are meaningful only relative to that committed session.
 	if len(n.Aggregate) != musig2.PubNonceSize || len(n.Partial) != 32 {
 		return nil, errors.New("nonces have not been bound")
 	}
@@ -121,6 +145,9 @@ func (n *nodeSigning) combine(key *btcec.PublicKey, node *tree.Node,
 		return nil, err
 	}
 	partials := []*musig2.PartialSignature{&own}
+
+	// Verification and combination must use the identical sorting and
+	// Taproot tweak rules used when producing each partial.
 	opts := []musig2.SignOption{musig2.WithSortedKeys()}
 	combine := musig2.WithBip86TweakedCombine(
 		[32]byte(digest), node.CoSigners, true,
@@ -133,6 +160,10 @@ func (n *nodeSigning) combine(key *btcec.PublicKey, node *tree.Node,
 	} else {
 		opts = append(opts, musig2.WithBip86SignTweak())
 	}
+
+	// Verify each expected signer against its previously bound nonce.
+	// Checking only the final signature would hide which transcript was
+	// invalid.
 	for _, peer := range node.CoSigners {
 		if peer.IsEqual(key) {
 			continue
@@ -160,6 +191,9 @@ func (n *nodeSigning) combine(key *btcec.PublicKey, node *tree.Node,
 	if len(peers) != len(partials)-1 {
 		return nil, errors.New("unexpected tree partial signatures")
 	}
+
+	// The aggregate must spend the actual tweaked output key, and a retry
+	// must reproduce the signature already recorded for this node.
 	point, err := btcec.ParsePubKey(n.CombinedPoint)
 	if err != nil {
 		return nil, err
@@ -180,9 +214,13 @@ func (n *nodeSigning) combine(key *btcec.PublicKey, node *tree.Node,
 }
 
 // standardPath extracts the collaborative branch of a standard boarding/VTXO.
+// raw must encode a StandardVTXO policy. The returned path is newly compiled;
+// custom policies fail rather than selecting an arbitrary cooperative leaf.
 func standardPath(raw []byte) (*arkscript.SpendPath,
 	*arkscript.StandardVTXOParams, error) {
 
+	// Decode the typed policy before selecting its leaf: arbitrary policy
+	// trees must not be mistaken for the standard owner/operator agreement.
 	policy, err := arkscript.DecodePolicyTemplate(raw)
 	if err != nil {
 		return nil, nil, err
@@ -191,6 +229,9 @@ func standardPath(raw []byte) (*arkscript.SpendPath,
 	if err != nil {
 		return nil, nil, err
 	}
+
+	// Resolve the collaborative leaf through the public compiler so its
+	// script and control block bind to the same policy as the client.
 	compiled, err := policy.Compile()
 	if err != nil {
 		return nil, nil, err
@@ -202,7 +243,12 @@ func standardPath(raw []byte) (*arkscript.SpendPath,
 }
 
 // verifyTransaction executes every input against its authoritative prevout.
+// prev must supply all inputs for Taproot hashing. Script execution checks
+// witness validity and transaction lock fields, but does not establish parent
+// confirmation, chain maturity, or unspentness.
 func verifyTransaction(tx *wire.MsgTx, prev txscript.PrevOutputFetcher) error {
+	// Use Bitcoin script execution as the final boundary, with the supplied
+	// amounts and scripts participating in Taproot signature verification.
 	hashes := txscript.NewTxSigHashes(tx, prev)
 	for i, in := range tx.TxIn {
 		out := prev.FetchPrevOutput(in.PreviousOutPoint)

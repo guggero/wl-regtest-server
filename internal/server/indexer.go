@@ -56,6 +56,9 @@ type indexEvent struct {
 func (s *Server) verifyScriptProof(ctx context.Context, script []byte,
 	proof *arkrpc.TaprootSchnorrProof, purpose string) error {
 
+	// Require an authenticated mailbox and bounded Taproot proof before TLV
+	// decoding; ownership is independent of merely knowing a receive
+	// script.
 	if principal(ctx) == "" || proof == nil || len(proof.Message) > 4096 ||
 		!txscript.IsPayToTaproot(script) {
 
@@ -76,6 +79,9 @@ func (s *Server) verifyScriptProof(ctx context.Context, script []byte,
 			codes.InvalidArgument, "malformed indexer proof",
 		)
 	}
+
+	// Domain, mailbox, purpose, and nonce separate registration proofs from
+	// query proofs and prevent replay across protocol operations.
 	wantType := "script_scope"
 	if purpose == "register_receive_script" ||
 		purpose == "unregister_receive_script" {
@@ -95,6 +101,9 @@ func (s *Server) verifyScriptProof(ctx context.Context, script []byte,
 			codes.PermissionDenied, "indexer proof scope mismatch",
 		)
 	}
+
+	// Allow limited clock skew while bounding proof lifetime, so a captured
+	// authorization cannot grant indefinite indexer access.
 	now := uint64(s.cfg.Clock.Now().Unix())
 	issued, expires := binary.BigEndian.Uint64(
 		fields[6],
@@ -112,6 +121,10 @@ func (s *Server) verifyScriptProof(ctx context.Context, script []byte,
 			codes.PermissionDenied, "indexer proof script mismatch",
 		)
 	}
+
+	// Participant proofs require a verified policy relationship for each
+	// queried script. Without a participant identity, the proof must
+	// instead bind this exact output key and script.
 	var key *btcec.PublicKey
 	identity := fields[11]
 	if len(identity) == 0 {
@@ -144,6 +157,10 @@ func (s *Server) verifyScriptProof(ctx context.Context, script []byte,
 			)
 		}
 	}
+
+	// Only after interpreting the scope do we verify the tagged message
+	// against the key whose authority over the script was established
+	// above.
 	sig, err := schnorr.ParseSignature(proof.Sig64)
 	if err != nil {
 		return status.Error(
@@ -166,6 +183,9 @@ func (s *Server) participates(script []byte, key *btcec.PublicKey) bool {
 	if len(script) != 34 {
 		return false
 	}
+
+	// Standard receive scripts can prove ownership before funding exists;
+	// reconstruct the advertised policy from the claimed owner key.
 	standard, err := arkscript.StandardVTXOTemplate(
 		key, s.key.PubKey(), s.cfg.ExitDelay,
 	)
@@ -178,6 +198,9 @@ func (s *Server) participates(script []byte, key *btcec.PublicKey) bool {
 	if bytes.Equal(schnorr.SerializePubKey(key), script[2:]) {
 		return true
 	}
+
+	// The operator appears in every collaborative policy but that alone
+	// must not grant participant access to all custom-script records.
 	if hasKey([]*btcec.PublicKey{s.key.PubKey()}, key) {
 		return false
 	}
@@ -188,6 +211,9 @@ func (s *Server) participates(script []byte, key *btcec.PublicKey) bool {
 			return true
 		}
 	}
+
+	// Previously indexed custom outputs also establish participant scope,
+	// even when no separate pre-funding policy registration was retained.
 	for recordKey := range s.state.Records {
 		if !strings.HasPrefix(recordKey, "vtxo/") {
 			continue
@@ -211,6 +237,8 @@ func registrationKey(owner string, script []byte) string {
 
 // RegisterReceiveScript stores a proven routing subscription idempotently.
 func (s *Server) RegisterReceiveScript(ctx context.Context, req *arkrpc.RegisterReceiveScriptRequest) (*arkrpc.RegisterReceiveScriptResponse, error) {
+	// Routing registration requires its own scoped proof; mailbox
+	// authentication alone does not show control of the destination script.
 	if err := s.verifyScriptProof(
 		ctx, req.GetPkScript(), req.GetTaprootSchnorr(),
 		"register_receive_script",
@@ -233,6 +261,9 @@ func (s *Server) RegisterReceiveScript(ctx context.Context, req *arkrpc.Register
 			codes.InvalidArgument, "registration expired",
 		)
 	}
+
+	// Key subscriptions by both mailbox and script so independently proven
+	// participants can receive notifications without replacing each other.
 	err := s.put(
 		registrationKey(principal(ctx), req.PkScript),
 		&registeredScript{
@@ -251,6 +282,9 @@ func (s *Server) RegisterReceiveScript(ctx context.Context, req *arkrpc.Register
 // ListMyReceiveScripts lists active subscriptions for the authenticated
 // mailbox.
 func (s *Server) ListMyReceiveScripts(ctx context.Context, _ *arkrpc.ListMyReceiveScriptsRequest) (*arkrpc.ListMyReceiveScriptsResponse, error) {
+	// Restrict discovery to this mailbox and omit expired subscriptions,
+	// matching the notification path's definition of an active
+	// registration.
 	resp := &arkrpc.ListMyReceiveScriptsResponse{}
 	for key := range s.state.Records {
 		if !strings.HasPrefix(key, "script/"+principal(ctx)+"/") {
@@ -264,6 +298,9 @@ func (s *Server) ListMyReceiveScripts(ctx context.Context, _ *arkrpc.ListMyRecei
 			resp.Scripts = append(resp.Scripts, r.Script)
 		}
 	}
+
+	// Return deterministic script order even though registrations are
+	// stored in a map, making repeated client reconciliation stable.
 	sort.Slice(resp.Scripts, func(i, j int) bool {
 		return bytes.Compare(
 			resp.Scripts[i].PkScript, resp.Scripts[j].PkScript,
@@ -300,6 +337,10 @@ func (s *Server) scriptScopes(ctx context.Context, scopes []*arkrpc.ScriptScope,
 			codes.InvalidArgument, "invalid script count",
 		)
 	}
+
+	// Verify each script independently even when scope proofs share a
+	// participant: participation in one policy does not authorize every
+	// policy.
 	allowed := make(map[string]bool)
 	for _, scope := range scopes {
 		if err := s.verifyScriptProof(
@@ -330,6 +371,9 @@ func (s *Server) ListVTXOsByScripts(ctx context.Context, req *arkrpc.ListVTXOsBy
 	if err != nil {
 		return nil, err
 	}
+
+	// Bind the cursor to a canonical mailbox, script set, and status filter
+	// so a page token cannot silently continue a different query.
 	var scripts []string
 	for script := range allowed {
 		scripts = append(scripts, script)
@@ -353,6 +397,10 @@ func (s *Server) ListVTXOsByScripts(ctx context.Context, req *arkrpc.ListVTXOsBy
 		}
 		after = string(req.Cursor[32:])
 	}
+
+	// Page by stable record key rather than map iteration. A next cursor is
+	// returned only after another matching result proves a further page
+	// exists.
 	var keys []string
 	for key := range s.state.Records {
 		if strings.HasPrefix(
@@ -396,6 +444,9 @@ func (s *Server) ListVTXOEventsByScripts(ctx context.Context, req *arkrpc.ListVT
 	if err != nil {
 		return nil, err
 	}
+
+	// Apply proof scope before pagination so unrelated events cannot
+	// consume this client's page or reveal private script activity.
 	resp := &arkrpc.ListVTXOEventsByScriptsResponse{
 		NextCursor: req.AfterEventId,
 	}
@@ -413,6 +464,10 @@ func (s *Server) ListVTXOEventsByScripts(ctx context.Context, req *arkrpc.ListVT
 			resp.Events = append(resp.Events, e.Event)
 		}
 	}
+
+	// Catch-up cursors advance through increasing durable event IDs,
+	// independent of record iteration order or notification delivery
+	// timing.
 	sort.Slice(resp.Events, func(i, j int) bool {
 		return resp.Events[i].EventId < resp.Events[j].EventId
 	})
@@ -436,6 +491,10 @@ func (s *Server) GetSubtreeByScripts(ctx context.Context, req *arkrpc.GetSubtree
 	if err != nil {
 		return nil, err
 	}
+
+	// Return only proven scripts, but include their full dependency paths
+	// when requested so a wallet can reconstruct an exit without more round
+	// data.
 	resp := &arkrpc.GetSubtreeByScriptsResponse{}
 	seen := make(map[string]bool)
 	for key := range s.state.Records {
@@ -453,6 +512,10 @@ func (s *Server) GetSubtreeByScripts(ctx context.Context, req *arkrpc.GetSubtree
 		if !req.IncludeInternalNodes {
 			continue
 		}
+
+		// Shared ancestors appear once in the expanded graph; their
+		// signed transactions and output-index edges preserve the
+		// actual spending relation.
 		for _, ancestry := range r.VTXO.AncestryPaths {
 			t, err := arkrpc.AncestryPathToTree(ancestry)
 			if err != nil {
@@ -514,6 +577,9 @@ func (s *Server) ListOORRecipientEventsByScript(ctx context.Context, req *arkrpc
 
 		return nil, err
 	}
+
+	// Offline receive recovery reads durable recipient packages, not just
+	// mailbox hints that may already have been acknowledged and pruned.
 	response := &arkrpc.ListOORRecipientEventsByScriptResponse{
 		NextCursor: req.AfterEventId,
 	}
@@ -531,6 +597,9 @@ func (s *Server) ListOORRecipientEventsByScript(ctx context.Context, req *arkrpc
 			response.Events = append(response.Events, event)
 		}
 	}
+
+	// Sort before truncation so each exclusive cursor resumes from the last
+	// delivered event without skipping earlier matches.
 	sort.Slice(response.Events, func(i, j int) bool {
 		return response.Events[i].EventId < response.Events[j].EventId
 	})
@@ -563,6 +632,10 @@ func (s *Server) GetOORSessionByTxid(ctx context.Context, req *arkrpc.GetOORSess
 	if err != nil {
 		return nil, err
 	}
+
+	// A proven script must belong to an input or recipient of this
+	// finalized session. Knowledge of its txid alone must not reveal the
+	// recovery package.
 	if r != nil && len(r.Final) > 0 {
 		for _, input := range r.Inputs {
 			record, err := get[vtxoRecord](s, "vtxo/"+input)
@@ -601,6 +674,9 @@ func (s *Server) indexRound(r *roundRecord) error {
 
 		return errors.New("round is not confirmed and signed")
 	}
+
+	// Confirmation activates the connector-bound replacement; consume the
+	// old VTXOs atomically with indexing the new signed leaves.
 	for _, input := range r.Request.ForfeitRequests {
 		outpoint, err := roundpb.OutpointFromProto(input.VtxoOutpoint)
 		if err != nil {
@@ -622,6 +698,9 @@ func (s *Server) indexRound(r *roundRecord) error {
 			return err
 		}
 	}
+
+	// Reattach persisted aggregate signatures and verify the complete tree
+	// before presenting any leaf as a recoverable live balance.
 	for index, encoded := range r.Batch.VtxoTreePaths {
 		t, err := roundpb.TreeFromProto(encoded)
 		if err != nil {
@@ -643,6 +722,10 @@ func (s *Server) indexRound(r *roundRecord) error {
 		if err := t.VerifySigned(); err != nil {
 			return err
 		}
+
+		// Match leaves through the admitted cosigner keys and extract
+		// only the signed branches needed for each wallet's unilateral
+		// recovery.
 		for i, req := range r.Request.VtxoRequests {
 			key, err := btcec.ParsePubKey(req.SigningKey)
 			if err != nil {
@@ -695,6 +778,10 @@ func (s *Server) indexRound(r *roundRecord) error {
 					ancestry,
 				},
 				OperatorPubkey: s.key.PubKey().SerializeCompressed(), ConstructionVersion: 1}
+
+			// Reindexing after a reorg must not revive value
+			// already consumed by an OOR transfer or a later
+			// confirmed forfeit.
 			old, err := get[vtxoRecord](s, "vtxo/"+op.String())
 			if err != nil {
 				return err
@@ -721,6 +808,9 @@ func (s *Server) indexRound(r *roundRecord) error {
 func (s *Server) recordVTXO(key string, record *vtxoRecord,
 	origin arkrpc.VTXOOrigin) error {
 
+	// Avoid duplicate events when reindexing unchanged lifecycle state;
+	// metadata can be refreshed without inventing another balance
+	// transition.
 	old, err := get[vtxoRecord](s, key)
 	if err != nil {
 		return err
@@ -737,6 +827,9 @@ func (s *Server) recordVTXO(key string, record *vtxoRecord,
 		}
 		eventType = arkrpc.VTXOEventType_VTXO_EVENT_TYPE_STATUS_CHANGED
 	}
+
+	// Allocate one global durable event sequence with the record update so
+	// catch-up queries never miss a committed lifecycle change.
 	counter, err := get[uint64](s, "index-event-counter")
 	if err != nil {
 		return err
@@ -762,6 +855,10 @@ func (s *Server) recordVTXO(key string, record *vtxoRecord,
 
 		return err
 	}
+
+	// Stage notifications only for active registrations after saving the
+	// catch-up event; disconnected recipients can later recover the same
+	// change.
 	notification := &arkrpc.IncomingVTXOEvent{
 		EventId: id, Type: eventType, Outpoint: v.Outpoint,
 		Status: v.Status, PkScript: v.PkScript, ValueSat: v.ValueSat,

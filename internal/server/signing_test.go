@@ -18,6 +18,8 @@ import (
 // malicious retries, and script-engine validation of complete transaction
 // trees.
 func TestTreeSigning(t *testing.T) {
+	// Vary tree shape and signer membership so nonce handling is checked
+	// for both a single branch and shared multi-recipient ancestors.
 	for _, count := range []int{1, 2, 7} {
 		t.Run(string(rune('0'+count)), func(t *testing.T) {
 			operator, err := btcec.NewPrivateKey()
@@ -39,6 +41,10 @@ func TestTreeSigning(t *testing.T) {
 				require.NoError(t, err)
 				outputs = append(outputs, *out)
 			}
+
+			// Use public tree construction to determine the actual
+			// tweaked output keys and authoritative prevouts used
+			// by every node signature.
 			batch, err := tree.BuildBatchOutput(
 				outputs, operator.PubKey(), sweep.PubKey(),
 				1440,
@@ -60,6 +66,11 @@ func TestTreeSigning(t *testing.T) {
 					operator, digest,
 				)
 				require.NoError(t, err)
+
+				// Generate client nonces independently from the
+				// server transcript; each node must bind the
+				// complete participant set before its secret is
+				// consumed.
 				clientNonces := make(map[string]*musig2.Nonces)
 				public := make(map[string][]byte)
 				for _, peer := range node.CoSigners {
@@ -93,6 +104,11 @@ func TestTreeSigning(t *testing.T) {
 					operator, node, digest,
 					virtual.SweepTapscriptRoot, public,
 				))
+
+				// Produce peer partials directly with MuSig2
+				// after restoring the server transcript,
+				// checking interoperability rather than signing
+				// through its helper.
 				partials := make(map[string][]byte)
 				for id, nonce := range clientNonces {
 					partial, err := musig2.Sign(
@@ -116,6 +132,11 @@ func TestTreeSigning(t *testing.T) {
 				)
 				require.NoError(t, err)
 				node.AddSignature(sig)
+
+				// A changed peer nonce on retry must be
+				// rejected after the secret has been erased;
+				// accepting it would enable dangerous nonce
+				// reuse.
 				for id, nonce := range public {
 					mutated := bytes.Clone(nonce)
 					mutated[4] ^= 1
@@ -127,6 +148,11 @@ func TestTreeSigning(t *testing.T) {
 					)
 					break
 				}
+
+				// Corrupt a participant share independently of
+				// the nonce mutation to verify
+				// partial-signature validation rejects invalid
+				// contributions.
 				for id, partial := range partials {
 					partials[id] = bytes.Repeat([]byte{
 						1,
@@ -140,6 +166,10 @@ func TestTreeSigning(t *testing.T) {
 					break
 				}
 			}
+
+			// Verify the complete tree and execute every witness
+			// against its prevout, proving the assembled signatures
+			// are actually spendable.
 			require.NoError(t, virtual.ValidateValueConservation())
 			require.NoError(t, virtual.VerifySigned())
 			for node := range virtual.Root.NodesIter() {

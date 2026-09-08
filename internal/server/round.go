@@ -37,8 +37,12 @@ const (
 	maxRoundItems = 64
 )
 
-// roundRecord describes one participant's round. The small operator seals
-// each intent separately, retaining all client-visible protocol phases.
+// roundRecord describes one participant's round. The small operator seals each
+// intent separately, retaining all client-visible protocol phases. A quote
+// reserves user inputs; acceptance fixes the funded batch and nonce sessions.
+// Tree signatures precede input signatures, and FinalTx is saved before
+// broadcast. Status is the public lifecycle; Phase tracks the finer internal
+// signing steps.
 type roundRecord struct {
 	ID              string
 	Owner           string
@@ -74,6 +78,8 @@ func roundID(raw []byte) (string, error) {
 }
 
 // ownedRound authorizes operations by the mailbox that admitted the intent.
+// The caller must hold s.mu; missing and foreign-owned rounds both return
+// NotFound, avoiding disclosure through a guessed round ID.
 func (s *Server) ownedRound(ctx context.Context, id string) (*roundRecord,
 	error) {
 
@@ -82,6 +88,9 @@ func (s *Server) ownedRound(ctx context.Context, id string) (*roundRecord,
 			codes.InvalidArgument, "invalid round ID",
 		)
 	}
+
+	// Hide other participants' rounds behind the same response as missing
+	// rounds; knowing a UUID does not grant authority over its funds.
 	r, err := get[roundRecord](s, roundKey(id))
 	if err != nil {
 		return nil, err
@@ -94,6 +103,8 @@ func (s *Server) ownedRound(ctx context.Context, id string) (*roundRecord,
 
 // ack reconstructs the admission event used to correlate the client actor.
 func (r *roundRecord) ack() *roundpb.ClientSuccessResp {
+	// Use the admitted request rather than current coin status so replay
+	// correlates the same inputs even after the round has completed.
 	id, _ := uuid.Parse(r.ID)
 	ack := &roundpb.ClientSuccessResp{RoundId: id[:]}
 	for _, req := range r.Request.BoardingRequests {
@@ -117,6 +128,9 @@ func joinDomain(req *roundpb.JoinRoundRequest) (*types.JoinRoundRequest,
 	if err != nil {
 		return nil, err
 	}
+
+	// Preserve request ordering and public intent fields when rebuilding
+	// the message covered by the client's proof of ownership.
 	domain := &types.JoinRoundRequest{Identifier: key}
 	for _, in := range req.BoardingRequests {
 		if in == nil {
@@ -148,6 +162,9 @@ func joinDomain(req *roundpb.JoinRoundRequest) (*types.JoinRoundRequest,
 			SigningKey: keychain.KeyDescriptor{PubKey: key},
 		})
 	}
+
+	// Custom policies carry their authorization and forfeit branches in the
+	// intent, preventing substitution after the owner signs the request.
 	for _, in := range req.ForfeitRequests {
 		if in == nil {
 			return nil, errors.New("nil forfeit input")
@@ -175,6 +192,9 @@ func joinDomain(req *roundpb.JoinRoundRequest) (*types.JoinRoundRequest,
 		}
 		domain.ForfeitReqs = append(domain.ForfeitReqs, f)
 	}
+
+	// On-chain destinations are part of the same authorization as VTXOs;
+	// bind both the script and the requested amount before checking proofs.
 	for _, out := range req.LeaveRequests {
 		if out == nil || out.TargetAmountSat < 0 ||
 			len(out.PkScript) == 0 {
@@ -191,10 +211,14 @@ func joinDomain(req *roundpb.JoinRoundRequest) (*types.JoinRoundRequest,
 }
 
 // JoinRound verifies actual funds and their BIP-322 proof before reserving
-// them.
+// them. It runs inside the authenticated mailbox transaction, which atomically
+// saves reservations, the quote, and response events. Amounts are satoshis and
+// proof validity is evaluated at the server's observed block height.
 func (s *Server) JoinRound(ctx context.Context,
 	req *roundpb.JoinRoundRequest) (*roundpb.ClientSuccessResp, error) {
 
+	// Admission needs an authenticated return mailbox and a bounded intent
+	// before any backend work or signature validation is attempted.
 	if req == nil || req.Auth == nil || principal(ctx) == "" {
 		return nil, status.Error(
 			codes.InvalidArgument, "authenticated intent required",
@@ -209,6 +233,9 @@ func (s *Server) JoinRound(ctx context.Context,
 			codes.InvalidArgument, "invalid round item count",
 		)
 	}
+
+	// Reconstruct the canonical authorization from the request itself so a
+	// valid proof cannot be paired with different destinations or inputs.
 	domain, err := joinDomain(req)
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
@@ -248,6 +275,10 @@ func (s *Server) JoinRound(ctx context.Context,
 			codes.InvalidArgument, "new intents must omit round ID",
 		)
 	}
+
+	// A fresh intent accumulates authoritative prevouts before reserving
+	// anything; the surrounding transaction rolls back all rejected
+	// admissions.
 	r := &roundRecord{ID: uuid.NewString(), Owner: principal(ctx),
 		Request: proto.Clone(req).(*roundpb.JoinRoundRequest),
 		Status:  roundpb.RoundLifecycleStatus_ROUND_STATUS_IN_FLIGHT,
@@ -283,6 +314,10 @@ func (s *Server) JoinRound(ctx context.Context,
 				"boarding input not confirmed or below minimum",
 			)
 		}
+
+		// The boarding output must commit to this operator and leave
+		// enough time for the advertised refund path; client-supplied
+		// policy bytes alone are not evidence of what was funded.
 		path, params, err := standardPath(in.PolicyTemplate)
 		if err != nil {
 			return nil, status.Error(
@@ -309,6 +344,9 @@ func (s *Server) JoinRound(ctx context.Context,
 		r.Coins = append(r.Coins, *coin)
 		total += coin.Output.Value
 	}
+
+	// Off-chain inputs must still be live and exclusively available. Their
+	// confirmed ancestry replaces the direct UTXO check used for boarding.
 	for _, in := range domain.ForfeitReqs {
 		outpoint := *in.VTXOOutpoint
 		if prev[outpoint] != nil {
@@ -338,6 +376,10 @@ func (s *Server) JoinRound(ctx context.Context,
 				codes.FailedPrecondition, err.Error(),
 			)
 		}
+
+		// Custom policies must identify a bound collaborative branch;
+		// standard VTXOs can use the conventional owner/operator branch
+		// implicitly.
 		path := in.ForfeitSpend
 		if path == nil {
 			path, _, err = standardPath(record.Policy)
@@ -356,6 +398,10 @@ func (s *Server) JoinRound(ctx context.Context,
 				codes.InvalidArgument, err.Error(),
 			)
 		}
+
+		// The operator must participate in the forfeiture, and each
+		// input value must fit the monetary range before contributing
+		// to the quote.
 		policy, err := arkscript.DecodePolicyTemplate(record.Policy)
 		if err != nil {
 			return nil, err
@@ -377,6 +423,9 @@ func (s *Server) JoinRound(ctx context.Context,
 		prev[outpoint] = wire.NewTxOut(value, record.VTXO.PkScript)
 		r.Forfeits = append(r.Forfeits, record)
 	}
+
+	// Verify ownership against authoritative amounts and scripts, not the
+	// metadata supplied alongside the client's proof.
 	challenge, err := bip322.JoinRoundMessageChallenge(domain.Identifier)
 	if err != nil {
 		return nil, err
@@ -393,6 +442,9 @@ func (s *Server) JoinRound(ctx context.Context,
 			codes.InvalidArgument, "proof must cover every input",
 		)
 	}
+
+	// The proof must cover the exact input set once each; a valid signature
+	// for only a subset cannot authorize reserving the remaining funds.
 	seen := make(map[wire.OutPoint]bool)
 	for _, in := range auth.Sig.ToSign.TxIn[1:] {
 		if prev[in.PreviousOutPoint] == nil ||
@@ -410,6 +462,9 @@ func (s *Server) JoinRound(ctx context.Context,
 			"invalid input proof: "+result.Reason,
 		)
 	}
+
+	// Only a fully authorized, balanced intent can reserve funds. Save its
+	// semantic retry key alongside the round and both admission events.
 	r.Quote, err = s.quote(r, total)
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
@@ -433,14 +488,22 @@ func (s *Server) JoinRound(ctx context.Context,
 
 // quote computes residual amounts once, applying the client's fixed/change
 // semantics. Regtest treasury funding subsidizes the commitment mining fee.
+// total is the admitted input value in satoshis. The request must already be
+// structurally decoded; the returned quote is not persisted by this helper.
 func (s *Server) quote(r *roundRecord, total int64) (*roundpb.JoinRoundQuote,
 	error) {
 
+	// One immutable quote per round lets acceptance and retries refer to
+	// the same amounts and expiry without renegotiating the intent.
 	qID := sha256.Sum256([]byte(r.ID + "/quote/0"))
 	q := &roundpb.JoinRoundQuote{RoundId: r.ID, QuoteId: qID[:],
 		QuoteExpiresAt: s.cfg.Clock.Now().Add(quoteLifetime).Unix()}
 	count := len(r.Request.VtxoRequests) + len(r.Request.LeaveRequests)
 	change, fixed := 0, int64(0)
+
+	// Validate exit policies while deriving their scripts; a destination
+	// that the client can compile must also satisfy the advertised exit
+	// terms.
 	for _, req := range r.Request.VtxoRequests {
 		policy, err := arkscript.DecodePolicyTemplate(
 			req.PolicyTemplate,
@@ -465,6 +528,10 @@ func (s *Server) quote(r *roundRecord, total int64) (*roundpb.JoinRoundQuote,
 		if err != nil {
 			return nil, err
 		}
+
+		// A sole flexible VTXO absorbs the residual implicitly. Mark
+		// its value unresolved until every fixed destination has been
+		// accounted for.
 		isChange := req.IsChange || count == 1 && !req.FixedAmount
 		if req.IsChange && req.FixedAmount {
 			return nil, errors.New("fixed output cannot be change")
@@ -485,6 +552,9 @@ func (s *Server) quote(r *roundRecord, total int64) (*roundpb.JoinRoundQuote,
 			RecipientKey: req.SigningKey,
 		})
 	}
+
+	// Leave outputs share the same residual pool as VTXOs, so there can be
+	// only one change destination across both kinds of output.
 	for _, req := range r.Request.LeaveRequests {
 		value := req.TargetAmountSat
 		if req.IsChange || count == 1 {
@@ -501,6 +571,9 @@ func (s *Server) quote(r *roundRecord, total int64) (*roundpb.JoinRoundQuote,
 			AmountSat: value,
 		})
 	}
+
+	// Require exact conservation before resolving change. Treasury subsidy
+	// covers fees separately and must not mask an unbalanced user intent.
 	if change > 1 || change == 0 && fixed != total || fixed > total {
 		return nil, errors.New(
 			"intent must balance with at most one change output",
@@ -514,6 +587,9 @@ func (s *Server) quote(r *roundRecord, total int64) (*roundpb.JoinRoundQuote,
 			return nil, errors.New("VTXO below minimum")
 		}
 	}
+
+	// Apply the same minimum after resolving on-chain change, and reject
+	// scripts that cannot serve as a spendable collaborative exit.
 	for _, out := range q.LeaveQuotes {
 		if out.AmountSat == -1 {
 			out.AmountSat = total - fixed
@@ -527,7 +603,8 @@ func (s *Server) quote(r *roundRecord, total int64) (*roundpb.JoinRoundQuote,
 	return q, nil
 }
 
-// emitRound schedules a typed protocol event for the round's participant.
+// emitRound schedules a typed protocol event for the round's participant. The
+// caller must be inside a state transaction; delivery is staged until commit.
 func (s *Server) emitRound(r *roundRecord, method string,
 	msg proto.Message) error {
 
@@ -535,9 +612,13 @@ func (s *Server) emitRound(r *roundRecord, method string,
 }
 
 // RejectQuote releases a round only while no signing artifacts exist.
+// This mailbox handler requires the dispatcher transaction. A wrong owner or
+// quote is rejected, and an accepted batch cannot be canceled through this RPC.
 func (s *Server) RejectQuote(ctx context.Context,
 	req *roundpb.JoinRoundReject) (*roundpb.ClientSuccessResp, error) {
 
+	// Releasing reservations is safe only before tree construction exposes
+	// signing artifacts that could still consume the admitted funds.
 	r, err := s.ownedRound(ctx, req.GetRoundId())
 	if err != nil {
 		return nil, err
@@ -547,6 +628,10 @@ func (s *Server) RejectQuote(ctx context.Context,
 			codes.FailedPrecondition, "quote cannot be rejected",
 		)
 	}
+
+	// Mark the admission dead and release both direct and virtual inputs in
+	// the enclosing mailbox transaction so no partially released round
+	// survives.
 	r.Phase, r.Status = "dead", roundpb.RoundLifecycleStatus_ROUND_STATUS_DEAD
 	for _, coin := range r.Coins {
 		delete(s.state.Records, "reserved/"+coin.Outpoint.String())
@@ -561,7 +646,9 @@ func (s *Server) RejectQuote(ctx context.Context,
 	return r.ack(), s.put(roundKey(r.ID), r)
 }
 
-// QueryRoundStatus returns a durable status event for client recovery.
+// QueryRoundStatus returns a durable status event for client recovery. This
+// mailbox handler requires the dispatcher transaction. Unknown or foreign-owned
+// IDs receive a dead status without exposing another owner's round.
 func (s *Server) QueryRoundStatus(ctx context.Context,
 	req *roundpb.QueryRoundStatusRequest) (*roundpb.ClientSuccessResp,
 	error) {
@@ -574,6 +661,9 @@ func (s *Server) QueryRoundStatus(ctx context.Context,
 	if err != nil {
 		return nil, err
 	}
+
+	// Report an unknown round as dead without revealing another mailbox
+	// owner's state; the requesting actor can then terminate recovery.
 	if r == nil || r.Owner != principal(ctx) {
 		r = &roundRecord{
 			ID: id,
@@ -603,6 +693,8 @@ func roundError(phase string, err error) error {
 // expireQuotes releases only unsigned admissions; once a signing artifact has
 // escaped, its input reservations remain tied to the durable round forever.
 func (s *Server) expireQuotes(ctx context.Context) error {
+	// Use the same rejection path as an explicit client cancellation, but
+	// only for unsigned quotes whose advertised lifetime has elapsed.
 	return s.transact(ctx, func() error {
 		for key := range s.state.Records {
 			if !strings.HasPrefix(key, "round/") {

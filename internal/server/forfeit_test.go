@@ -21,6 +21,9 @@ import (
 // TestConnectorForfeits checks single-leaf and branched connector signatures
 // and verifies a client's forfeit cannot redirect or inflate the penalty.
 func TestConnectorForfeits(t *testing.T) {
+	// Cover a degenerate connector tree, a branched tree, and a three-party
+	// vHTLC leaf so the same penalty path is checked across signer
+	// topologies.
 	for _, test := range []struct {
 		name   string
 		count  int
@@ -40,6 +43,10 @@ func TestConnectorForfeits(t *testing.T) {
 				owner.PubKey(), s.key.PubKey(), s.cfg.ExitDelay,
 			)
 			require.NoError(t, err)
+
+			// The custom case adds a swap receiver share; ordinary
+			// two-party forfeit compatibility must not omit that
+			// required participant.
 			var extra *btcec.PrivateKey
 			var customPath *arkscript.SpendPath
 			if test.custom {
@@ -73,6 +80,10 @@ func TestConnectorForfeits(t *testing.T) {
 			}
 			rawSpend, err := spend.Encode()
 			require.NoError(t, err)
+
+			// Model admitted inputs in request order so connector
+			// assignment can be checked against the same round data
+			// used by production validation.
 			r := &roundRecord{
 				ID:      uuid.NewString(),
 				Request: &roundpb.JoinRoundRequest{},
@@ -99,6 +110,10 @@ func TestConnectorForfeits(t *testing.T) {
 					Policy: rawPolicy,
 				})
 			}
+
+			// Construct actual signed connector branches anchored
+			// in one commitment before asking the client-side
+			// builder for its conditional penalty.
 			connectorScript, err := txscript.PayToTaprootScript(
 				txscript.ComputeTaprootKeyNoScript(s.key.PubKey()),
 			)
@@ -125,6 +140,10 @@ func TestConnectorForfeits(t *testing.T) {
 				&previous, 10000, &connector, 330, penalty,
 			)
 			require.NoError(t, err)
+
+			// Sign against both authoritative prevouts as a client
+			// would; the server must complete a script-valid
+			// penalty from these participant shares.
 			packet, err := psbt.NewFromUnsignedTx(tx)
 			require.NoError(t, err)
 			packet.Inputs[0].WitnessUtxo = wire.NewTxOut(
@@ -168,6 +187,10 @@ func TestConnectorForfeits(t *testing.T) {
 			require.NoError(t, err)
 			_, err = s.signForfeit(r, submitted, previous)
 			require.NoError(t, err)
+
+			// A penalty with inflated output value must fail
+			// structural validation even when it carries signatures
+			// from an otherwise valid submission.
 			tx.TxOut[0].Value++
 			raw.Reset()
 			require.NoError(t, tx.Serialize(&raw))

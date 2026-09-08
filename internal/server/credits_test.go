@@ -25,6 +25,9 @@ func signCreditRequest(t *testing.T, s *Server, key *btcec.PrivateKey,
 	req proto.Message) {
 
 	t.Helper()
+
+	// Use upstream domain separation and a fresh nonce, while deriving the
+	// expiry from the server clock so fake-time tests remain deterministic.
 	digest, account, err := swaprpc.CreditAccountRequestDigest(req)
 	require.NoError(t, err)
 	nonce := make([]byte, 32)
@@ -46,6 +49,8 @@ func signCreditRequest(t *testing.T, s *Server, key *btcec.PrivateKey,
 // TestCreditAuthorization verifies account isolation, request binding, expiry,
 // and nonce recovery across process restart without requiring a Lightning node.
 func TestCreditAuthorization(t *testing.T) {
+	// A fresh account can list its empty balance and replay the exact proof
+	// without consuming value or conflicting with its own nonce.
 	dir := t.TempDir()
 	s := testServer(t, dir)
 	key, err := btcec.NewPrivateKey()
@@ -58,10 +63,16 @@ func TestCreditAuthorization(t *testing.T) {
 	require.NoError(t, err)
 	_, err = s.ListCredits(context.Background(), req)
 	require.NoError(t, err)
+
+	// Changing even a read limit invalidates the request-bound signature;
+	// authentication must not cover only the account identity.
 	changed := proto.Clone(req).(*swaprpc.ListCreditsRequest)
 	changed.Limit = 42
 	_, err = s.ListCredits(context.Background(), changed)
 	require.Equal(t, codes.Unauthenticated, status.Code(err))
+
+	// Re-sign the changed request with the old nonce to separate signature
+	// validity from durable nonce-reuse protection across restoration.
 	digest, account, err := swaprpc.CreditAccountRequestDigest(changed)
 	require.NoError(t, err)
 	auth := changed.AccountAuthorization
@@ -74,6 +85,9 @@ func TestCreditAuthorization(t *testing.T) {
 	restored := testServer(t, dir)
 	_, err = restored.ListCredits(context.Background(), changed)
 	require.Equal(t, codes.AlreadyExists, status.Code(err))
+
+	// Expired or foreign-account authorizations cannot inherit the original
+	// request's access, even when the remaining fields are unchanged.
 	expired := proto.Clone(req).(*swaprpc.ListCreditsRequest)
 	expired.AccountAuthorization.ExpiresAtUnix = s.cfg.Clock.Now().Unix() -
 		1
@@ -90,6 +104,8 @@ func TestCreditAuthorization(t *testing.T) {
 // TestCreditLedger ensures reserved value cannot be debited twice or exceed
 // finalized funding, including after restoring the durable ledger.
 func TestCreditLedger(t *testing.T) {
+	// Post a funding movement twice under the same operation to establish
+	// idempotency, then reject an altered amount under that identity.
 	dir := t.TempDir()
 	s := testServer(t, dir)
 	r := &creditRecord{
@@ -107,6 +123,9 @@ func TestCreditLedger(t *testing.T) {
 	require.Error(t, s.transact(context.Background(), func() error {
 		return s.postCredit(r, "credit", 1001)
 	}))
+
+	// A debit needs a reservation, not merely enough finalized balance.
+	// Reserve and consume together only after the unreserved attempt fails.
 	r.Operation.OperationId = "redeem"
 	require.Error(t, s.transact(context.Background(), func() error {
 		return s.postCredit(r, "debit", 600)
@@ -122,6 +141,9 @@ func TestCreditLedger(t *testing.T) {
 		}
 		return s.postCredit(r, "debit", 600)
 	}))
+
+	// Restore the ledger and replay the debit to verify that its durable
+	// identity prevents subtracting another 600 satoshis.
 	restored := testServer(t, dir)
 	require.NoError(
 		t, restored.transact(context.Background(), func() error {
@@ -163,6 +185,9 @@ func (n *ambiguousInvoiceNode) AddInvoice(_ context.Context, req *lnrpc.Invoice,
 
 	n.mu.Lock()
 	defer n.mu.Unlock()
+
+	// Commit the fake invoice before returning an error to model the
+	// uncertainty of losing an RPC response after LND applied the request.
 	n.invoice = proto.Clone(req).(*lnrpc.Invoice)
 	hash := sha256.Sum256(req.RPreimage)
 	n.invoice.RHash = hash[:]
@@ -175,6 +200,8 @@ func (n *ambiguousInvoiceNode) AddInvoice(_ context.Context, req *lnrpc.Invoice,
 // TestCreditAmbiguousInvoice verifies recovery from legacy LND errors and
 // concurrent settlement polling without duplicate credit creation.
 func TestCreditAmbiguousInvoice(t *testing.T) {
+	// The fake returns an ambiguous creation error while retaining the
+	// invoice; the server must recover that same invoice by hash.
 	s := testServer(t, t.TempDir())
 	node := &ambiguousInvoiceNode{}
 	s.cfg.LND.Lightning = node
@@ -190,6 +217,9 @@ func TestCreditAmbiguousInvoice(t *testing.T) {
 	funded, err := s.CreateCredit(context.Background(), req)
 	require.NoError(t, err)
 	require.Equal(t, "committed-invoice", funded.Invoice)
+
+	// Make settlement visible before two concurrent pollers run, forcing
+	// both to reconcile the same funding evidence without double posting.
 	node.mu.Lock()
 	node.invoice.State = lnrpc.Invoice_SETTLED
 	node.invoice.AmtPaidSat = 500
@@ -205,6 +235,9 @@ func TestCreditAmbiguousInvoice(t *testing.T) {
 	for range 2 {
 		require.NoError(t, <-results)
 	}
+
+	// Assert through the authenticated public balance view after both
+	// workers report back to the test goroutine.
 	listing := &swaprpc.ListCreditsRequest{AccountPubkey: req.AccountPubkey}
 	signCreditRequest(t, s, key, listing)
 	snapshot, err := s.ListCredits(context.Background(), listing)

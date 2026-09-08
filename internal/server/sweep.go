@@ -28,6 +28,9 @@ const (
 // actual CSV maturity. The operator's original timeout leaf is used unchanged;
 // users retain the complete exit window advertised in their commitment.
 func (s *Server) sweepExpiredRoots(ctx context.Context) error {
+	// Snapshot confirmed rounds whose recorded age makes recovery
+	// plausible; Bitcoin will be queried separately for their current
+	// maturity.
 	s.mu.Lock()
 	var rounds []*roundRecord
 	height := s.height
@@ -54,6 +57,10 @@ func (s *Server) sweepExpiredRoots(ctx context.Context) error {
 		}
 	}
 	s.mu.Unlock()
+
+	// A reorg or a user exit can invalidate the snapshot. Require the
+	// actual root to remain unspent and CSV-mature before preparing a
+	// sweep.
 	for _, round := range rounds {
 		packet, err := psbtutil.Parse(round.Batch.BatchPsbt)
 		if err != nil {
@@ -75,6 +82,10 @@ func (s *Server) sweepExpiredRoots(ctx context.Context) error {
 
 			continue
 		}
+
+		// Reuse the durable transaction after retries or restart,
+		// rather than creating competing sweeps with fresh wallet
+		// destinations.
 		key := "expiry-sweep/" + round.ID
 		s.mu.Lock()
 		persisted, err := get[[]byte](s, key)
@@ -83,6 +94,9 @@ func (s *Server) sweepExpiredRoots(ctx context.Context) error {
 			return err
 		}
 		if persisted == nil {
+			// Recovered funds return to the connected LND wallet so
+			// later rounds can reuse them; obtain its destination
+			// only for a new sweep.
 			rpcCtx, cancel := context.WithTimeout(
 				ctx, backend.RPCTimeout,
 			)
@@ -112,6 +126,10 @@ func (s *Server) sweepExpiredRoots(ctx context.Context) error {
 			if err != nil {
 				return err
 			}
+
+			// Save the exact signed bytes before broadcast so a
+			// crash cannot lose the identity of an already
+			// published recovery transaction.
 			if err := s.transact(ctx, func() error {
 				return s.put(key, raw)
 			}); err != nil {
@@ -131,11 +149,17 @@ func (s *Server) sweepExpiredRoots(ctx context.Context) error {
 	return nil
 }
 
-// buildExpirySweep signs and independently executes the original branch
-// timeout script before retaining any broadcastable recovery transaction.
+// buildExpirySweep signs and independently executes the original branch timeout
+// script before retaining any broadcastable recovery transaction. batch must
+// contain the original root metadata at output zero; coin must be the
+// authoritative root UTXO and destination a wallet output script. The caller
+// checks CSV maturity and value before requesting the fixed-fee sweep.
 func (s *Server) buildExpirySweep(round *roundRecord, batch *psbt.Packet,
 	coin *backend.Coin, destination []byte) ([]byte, error) {
 
+	// Reconstruct the original timeout leaf from the persisted batch terms.
+	// Current configuration must not shorten the users' committed exit
+	// window.
 	internal, err := schnorr.ParsePubKey(
 		batch.Outputs[0].TaprootInternalKey,
 	)
@@ -149,6 +173,9 @@ func (s *Server) buildExpirySweep(round *roundRecord, batch *psbt.Packet,
 	if err != nil {
 		return nil, err
 	}
+
+	// Version two and the original block sequence activate CSV. The fixed
+	// fee is deducted from this root alone, without adding wallet inputs.
 	tx := wire.NewMsgTx(2)
 	tx.AddTxIn(wire.NewTxIn(&coin.Outpoint, nil, nil))
 	tx.TxIn[0].Sequence = round.Batch.SweepDelay
@@ -173,6 +200,9 @@ func (s *Server) buildExpirySweep(round *roundRecord, batch *psbt.Packet,
 	tx.TxIn[0].Witness = wire.TxWitness{
 		signature, spend.WitnessScript, spend.ControlBlock,
 	}
+
+	// Validate the assembled recovery witness before saving broadcastable
+	// bytes; a wrong key, control block, or sequence must fail locally.
 	if err := verifyTransaction(tx, fetcher); err != nil {
 		return nil, err
 	}

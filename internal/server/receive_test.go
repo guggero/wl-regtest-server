@@ -22,6 +22,9 @@ import (
 // TestReceiveCircuitAdmission exercises multipart aggregation, exact circuit
 // replay, hash and amount binding, and the signed acknowledgement funding gate.
 func TestReceiveCircuitAdmission(t *testing.T) {
+	// Model an available interceptor and authenticated receiver so the test
+	// can focus on shard collection and consent without a live Lightning
+	// node.
 	s := testServer(t, t.TempDir())
 	s.interceptorReady = true
 	s.lndPubkey = s.deriveKey("test-lnd").PubKey().SerializeCompressed()
@@ -38,6 +41,9 @@ func TestReceiveCircuitAdmission(t *testing.T) {
 	route, err := s.RequestChannelId(context.Background(), request)
 	require.NoError(t, err)
 	channel := route.RouteHintPaths[0].Hops[0].ChannelId
+
+	// Hold a partial payment first: incomplete totals must neither produce
+	// final vHTLC terms nor fund the receiver.
 	first := &routerrpc.ForwardHtlcInterceptRequest{IncomingCircuitKey: &routerrpc.CircuitKey{
 		ChanId: 42,
 		HtlcId: 1,
@@ -53,6 +59,9 @@ func TestReceiveCircuitAdmission(t *testing.T) {
 	resp, err = s.acceptIntercept(context.Background(), first)
 	require.NoError(t, err)
 	require.Nil(t, resp)
+
+	// A distinct shard exceeding the remaining invoice amount must fail
+	// without consuming its circuit ID or changing the collected total.
 	oversized := proto.Clone(first).(*routerrpc.ForwardHtlcInterceptRequest)
 	oversized.IncomingCircuitKey.HtlcId = 2
 	oversized.OutgoingAmountMsat = 7000000
@@ -60,6 +69,9 @@ func TestReceiveCircuitAdmission(t *testing.T) {
 	resp, err = s.acceptIntercept(context.Background(), oversized)
 	require.NoError(t, err)
 	require.Equal(t, routerrpc.ResolveHoldForwardAction_FAIL, resp.Action)
+
+	// The exact remaining amount completes collection but still leaves
+	// treasury funding gated on a signed receiver acknowledgement.
 	second := proto.Clone(
 		oversized,
 	).(*routerrpc.ForwardHtlcInterceptRequest)
@@ -73,6 +85,9 @@ func TestReceiveCircuitAdmission(t *testing.T) {
 	require.Equal(t, "awaiting-ack", r.Phase)
 	require.Len(t, r.Circuits, 2)
 	require.Empty(t, r.Session)
+
+	// First reject missing consent, then sign the exact negotiated script
+	// and amount using the upstream acknowledgement digest.
 	ack := &swaprpc.AcknowledgeOutSwapHtlcRequest{
 		PaymentHash:       hash[:],
 		ClientVhtlcPubkey: receiver.PubKey().SerializeCompressed(),

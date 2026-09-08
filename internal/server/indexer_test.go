@@ -20,6 +20,8 @@ import (
 // TestIndexerProofCompatibility verifies public-client TLV proofs, including
 // participant binding, cross-purpose rejection, and the signed expiry window.
 func TestIndexerProofCompatibility(t *testing.T) {
+	// Generate the scope proof through the upstream indexer client so the
+	// test checks wire compatibility independently of the server verifier.
 	s := testServer(t, t.TempDir())
 	key, err := btcec.NewPrivateKey()
 	require.NoError(t, err)
@@ -44,6 +46,9 @@ func TestIndexerProofCompatibility(t *testing.T) {
 	resp, err := s.ListVTXOsByScripts(ctx, req)
 	require.NoError(t, err)
 	require.Empty(t, resp.Vtxos)
+
+	// The same valid query proof must not authorize registration or access
+	// to a script owned by another participant.
 	proof := req.Scripts[0].GetTaprootSchnorr()
 	err = s.verifyScriptProof(ctx, script, proof, "register_receive_script")
 	require.Equal(t, codes.PermissionDenied, status.Code(err))
@@ -59,6 +64,9 @@ func TestIndexerProofCompatibility(t *testing.T) {
 		ctx, otherScript, proof, "list_vtxos_by_scripts",
 	)
 	require.Equal(t, codes.PermissionDenied, status.Code(err))
+
+	// Mailbox identity and validity window are also signed scope: neither a
+	// different principal nor an expired clock may reuse the proof.
 	foreign := context.WithValue(ctx, principalKey{}, "another-principal")
 	_, err = s.ListVTXOsByScripts(foreign, req)
 	require.Equal(t, codes.PermissionDenied, status.Code(err))
@@ -71,6 +79,8 @@ func TestIndexerProofCompatibility(t *testing.T) {
 // survive restart without generating duplicate events when a round is
 // rescanned.
 func TestIndexerEventRecovery(t *testing.T) {
+	// Create one registered recipient and one live VTXO so the state change
+	// produces both durable catch-up history and a mailbox notification.
 	dir := t.TempDir()
 	s := testServer(t, dir)
 	ctx := context.Background()
@@ -100,6 +110,9 @@ func TestIndexerEventRecovery(t *testing.T) {
 	require.NoError(t, err)
 	require.EqualValues(t, 1, record.EventID)
 	require.Len(t, s.state.Mail["receiver"].Messages, 1)
+
+	// Reindex unchanged data after restart to ensure recovery preserves the
+	// original event ID and does not enqueue a duplicate notification.
 	require.NoError(t, s.Stop())
 	s = testServer(t, dir)
 	err = s.transact(ctx, func() error {
@@ -111,6 +124,9 @@ func TestIndexerEventRecovery(t *testing.T) {
 	require.NoError(t, err)
 	require.EqualValues(t, 1, record.EventID)
 	require.Len(t, s.state.Mail["receiver"].Messages, 1)
+
+	// An actual expiry change must produce a new event, distinguishing
+	// meaningful lifecycle updates from idempotent rescans.
 	record.VTXO.BatchExpiryHeight++
 	err = s.transact(ctx, func() error {
 		return s.recordVTXO(

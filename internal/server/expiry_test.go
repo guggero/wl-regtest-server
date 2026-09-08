@@ -13,6 +13,9 @@ import (
 // TestUnfundedCreditExpiry releases an abandoned quote exactly once while
 // preserving the reservation of a Lightning payment with an ambiguous result.
 func TestUnfundedCreditExpiry(t *testing.T) {
+	// Use a controlled clock and two equal reservations that differ only in
+	// whether Lightning payment has begun; expiry may release only the
+	// unfunded one.
 	s := testServer(t, t.TempDir())
 	now := time.Unix(1800000000, 0)
 	clk := clock.NewTestClock(now)
@@ -50,10 +53,15 @@ func TestUnfundedCreditExpiry(t *testing.T) {
 		}
 		return nil
 	}))
+
+	// Before the deadline, neither reservation may change.
 	require.NoError(t, s.expireAwaitingSwaps(t.Context()))
 	account, err := s.account("test")
 	require.NoError(t, err)
 	require.EqualValues(t, 2000, account.Reserved)
+
+	// At the exact deadline, repeated reconciliation must release one
+	// reservation once while leaving the ambiguous paying attempt intact.
 	clk.SetTime(now.Add(time.Minute))
 	for range 2 {
 		require.NoError(t, s.expireAwaitingSwaps(t.Context()))

@@ -54,8 +54,14 @@ type LND struct {
 	Invoices  invoicesrpc.InvoicesClient
 }
 
-// Connect opens the LND connection. Readiness is verified separately with Info.
+// Connect loads LND credentials and creates shared wallet, router and invoice
+// clients. The caller owns the returned Conn and must close it after all users
+// stop. Dialing is lazy: success does not establish backend readiness or
+// network identity; call Info before admitting protocol work.
 func Connect(cfg LNDConfig) (*LND, error) {
+	// TLS is the default even on regtest because the macaroon grants wallet
+	// capabilities. Plaintext is available only through the explicit config
+	// flag.
 	var transport credentials.TransportCredentials
 	if cfg.Insecure {
 		transport = insecure.NewCredentials()
@@ -68,6 +74,10 @@ func Connect(cfg LNDConfig) (*LND, error) {
 			return nil, fmt.Errorf("load LND TLS certificate: %w", err)
 		}
 	}
+
+	// Read the credential once and attach it to every RPC on the shared
+	// connection. Its transport requirement must agree with the selected
+	// mode.
 	mac, err := os.ReadFile(cfg.Macaroon)
 	if err != nil {
 		return nil, fmt.Errorf("load LND macaroon: %w", err)
@@ -95,6 +105,9 @@ func (l *LND) Info(ctx context.Context) (*lnrpc.GetInfoResponse, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// A usable RPC connection is not sufficient: funding on a different
+	// network would produce transactions the regtest clients cannot use.
 	if len(info.Chains) != 1 || info.Chains[0].Chain != "bitcoin" ||
 		info.Chains[0].Network != "regtest" {
 
@@ -105,14 +118,24 @@ func (l *LND) Info(ctx context.Context) (*lnrpc.GetInfoResponse, error) {
 
 // Coins lists confirmed wallet coins available to back commitments.
 func (l *LND) Coins(ctx context.Context) ([]Coin, error) {
+	// Commitment funding requires confirmed wallet inputs. Mempool change
+	// must wait for a block rather than becoming another unconfirmed
+	// dependency.
 	resp, err := l.Wallet.ListUnspent(ctx, &walletrpc.ListUnspentRequest{
 		MinConfs: 1, MaxConfs: 1<<31 - 1,
 	})
 	if err != nil {
 		return nil, err
 	}
+
+	// Normalize both LND outpoint encodings at the boundary; the rest of
+	// the server uses wire outpoints and decoded scripts independently of
+	// RPC format.
 	coins := make([]Coin, 0, len(resp.Utxos))
 	for _, utxo := range resp.Utxos {
+		// LND can populate either the human-readable txid or its raw
+		// bytes. Try the displayed hash first, then let the hash
+		// library handle byte order.
 		hash, err := chainhash.NewHashFromStr(utxo.Outpoint.TxidStr)
 		if err != nil {
 			hash, err = chainhash.NewHash(utxo.Outpoint.TxidBytes)
@@ -134,8 +157,9 @@ func (l *LND) Coins(ctx context.Context) ([]Coin, error) {
 	return coins, nil
 }
 
-// Sign signs the wallet-owned inputs of a PSBT without changing its
-// transaction.
+// Sign asks WalletKit to sign wallet-owned inputs without funding or changing
+// the proposed transaction. The caller must supply the PSBT input metadata and
+// retain responsibility for non-wallet signatures and final script validation.
 func (l *LND) Sign(ctx context.Context, packet *psbt.Packet) (*psbt.Packet,
 	error) {
 
@@ -143,6 +167,10 @@ func (l *LND) Sign(ctx context.Context, packet *psbt.Packet) (*psbt.Packet,
 	if err := packet.Serialize(&raw); err != nil {
 		return nil, err
 	}
+
+	// SignPsbt leaves non-wallet inputs available for Ark participant
+	// signing. Keeping the PSBT form avoids prematurely finalizing a
+	// mixed-input batch.
 	resp, err := l.Wallet.SignPsbt(ctx, &walletrpc.SignPsbtRequest{
 		FundedPsbt: raw.Bytes(),
 	})

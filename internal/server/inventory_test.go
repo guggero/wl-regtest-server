@@ -16,6 +16,9 @@ import (
 // OOR signing path and verifies that small change remains correctly indexed
 // when the public builder sorts both checkpoint inputs and recipient outputs.
 func TestInventoryCanonicalFunding(t *testing.T) {
+	// Give every treasury input a different owner key so canonical input
+	// sorting cannot accidentally succeed with signatures attached by
+	// selection order.
 	s := testServer(t, t.TempDir())
 	var inputs []wire.OutPoint
 	for i := range 8 {
@@ -48,6 +51,10 @@ func TestInventoryCanonicalFunding(t *testing.T) {
 			},
 		}))
 	}
+
+	// Send most of the selected value, leaving smaller change that sorts
+	// before the recipient; the returned funding index must follow that
+	// sorting.
 	policy, err := arkscript.StandardVTXOTemplate(
 		s.deriveKey("recipient").PubKey(), s.key.PubKey(),
 		s.cfg.ExitDelay,
@@ -66,6 +73,9 @@ func TestInventoryCanonicalFunding(t *testing.T) {
 	require.NotNil(t, funding)
 	require.EqualValues(t, 1, funding.Outpoint.Index)
 	require.Equal(t, funding.Session, funding.Outpoint.Hash.String())
+
+	// Inspect and execute the persisted signed package rather than trusting
+	// only the helper's returned outpoint.
 	record, err := get[oorRecord](s, "oor/"+funding.Session)
 	require.NoError(t, err)
 	require.NotNil(t, record)
@@ -78,6 +88,9 @@ func TestInventoryCanonicalFunding(t *testing.T) {
 	require.EqualValues(t, 5000, tx.TxOut[0].Value)
 	require.EqualValues(t, 75000, tx.TxOut[1].Value)
 	require.Equal(t, script, tx.TxOut[1].PkScript)
+
+	// Both change and payment must be indexed at their canonical output
+	// positions, while every original treasury input becomes spent.
 	for i := range 2 {
 		op := wire.OutPoint{Hash: tx.TxHash(), Index: uint32(i)}
 		output, err := get[vtxoRecord](s, "vtxo/"+op.String())

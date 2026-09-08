@@ -17,8 +17,14 @@ import (
 )
 
 // AuthorizeInSwapRefund signs only the sender's canonical refund checkpoint,
-// after a terminal Lightning failure or expiry before payment initiation.
+// after a terminal Lightning failure or expiry before payment initiation. It
+// returns the swap-receiver share, not a completed refund transaction. The
+// exact live indexed vHTLC, original policy, amount in satoshis, and canonical
+// sender checkpoint are required; same-Ark payments are excluded.
 func (s *Server) AuthorizeInSwapRefund(ctx context.Context, req *swaprpc.AuthorizeInSwapRefundRequest) (*swaprpc.AuthorizeInSwapRefundResponse, error) {
+	// Refund authorization would let the sender recover its funding, so
+	// require a durable failure that cannot later become a successful
+	// Lightning pay.
 	var response *swaprpc.AuthorizeInSwapRefundResponse
 	err := s.transact(ctx, func() error {
 		if len(
@@ -66,6 +72,10 @@ func (s *Server) AuthorizeInSwapRefund(ctx context.Context, req *swaprpc.Authori
 				return err
 			}
 		}
+
+		// Match the exact funded value and policy before looking up
+		// spendability; an authorization must not be reusable against
+		// another conditional output.
 		if req.VhtlcOutpoint != r.Outpoint ||
 			req.VhtlcAmountSat != r.Response.AmountSat ||
 			!bytes.Equal(req.VhtlcPolicyTemplate, r.Policy) {
@@ -87,6 +97,10 @@ func (s *Server) AuthorizeInSwapRefund(ctx context.Context, req *swaprpc.Authori
 				"refund input not live",
 			)
 		}
+
+		// Reconstruct the original cooperative refund branch from
+		// admitted terms rather than accepting a requester-selected
+		// script.
 		sender, err := btcec.ParsePubKey(r.Request.ClientVhtlcPubkey)
 		if err != nil {
 			return err
@@ -113,6 +127,10 @@ func (s *Server) AuthorizeInSwapRefund(ctx context.Context, req *swaprpc.Authori
 				"wrong refund spend path",
 			)
 		}
+
+		// Rebuild a checkpoint that returns ownership to the sender
+		// while retaining operator participation, then compare
+		// transaction and prevout metadata.
 		packet, err := psbtutil.Parse(req.CheckpointPsbt)
 		if err != nil {
 			return status.Error(
@@ -168,6 +186,10 @@ func (s *Server) AuthorizeInSwapRefund(ctx context.Context, req *swaprpc.Authori
 					"sender checkpoint",
 			)
 		}
+
+		// Release only the swap-receiver share, with a durable record
+		// of its authorization. The remaining owner/operator signing
+		// flow completes the refund.
 		if err := signPacketInput(
 			packet, 0, receiver, path,
 		); err != nil {

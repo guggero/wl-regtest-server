@@ -37,6 +37,9 @@ func main() {
 
 // run owns connections, signal cancellation, and ordered daemon shutdown.
 func run() error {
+	// Resolve environment defaults through flags so a container and a local
+	// binary use the same configuration rules. Flags can override each
+	// default.
 	cfg := server.DefaultConfig()
 	bitcoin := &backend.Bitcoin{}
 	lndCfg := backend.LNDConfig{}
@@ -82,9 +85,16 @@ func run() error {
 	if flags.NArg() != 0 {
 		return errors.New("unexpected positional arguments")
 	}
+
+	// The container probe must work without opening the operator database
+	// or loading LND credentials; it only inspects the already-running RPC
+	// process.
 	if *health {
 		return checkHealth(cfg.Listen)
 	}
+
+	// Install the requested log level before starting workers so startup
+	// and background diagnostics use the same logger.
 	level := slog.LevelInfo
 	if *debug {
 		level = slog.LevelDebug
@@ -94,6 +104,10 @@ func run() error {
 			Level: level,
 		},
 	))
+
+	// The signal context is the common shutdown root. Deferred cleanup
+	// stops the daemon before closing the LND connection its workers still
+	// depend on.
 	ctx, cancel := signal.NotifyContext(
 		context.Background(), syscall.SIGINT, syscall.SIGTERM,
 	)
@@ -103,6 +117,9 @@ func run() error {
 		return err
 	}
 	defer func() { _ = lnd.Conn.Close() }()
+
+	// Construction restores durable state; Start separately verifies both
+	// backends before opening the client listener.
 	cfg.Bitcoin, cfg.LND = bitcoin, lnd
 	daemon, err := server.New(cfg)
 	if err != nil {
@@ -116,10 +133,17 @@ func run() error {
 		"Wavelength regtest operator listening", "address",
 		daemon.Address(),
 	)
+
+	// A listener failure must terminate the process just like a startup
+	// error. Normal signal cancellation instead returns success after
+	// deferred cleanup.
 	select {
+	// Termination signals request an orderly drain through the deferred
+	// Stop.
 	case <-ctx.Done():
 		return nil
 
+	// An unexpected listener exit cannot leave a healthy-looking process.
 	case err := <-daemon.Failures():
 		return err
 	}
@@ -127,6 +151,9 @@ func run() error {
 
 // checkHealth implements the container's bounded readiness probe.
 func checkHealth(address string) error {
+	// Keep the probe shorter than the container health-check timeout so a
+	// non-responsive listener produces a useful failure rather than
+	// hanging.
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	conn, err := grpc.NewClient(address, grpc.WithTransportCredentials(
@@ -136,6 +163,9 @@ func checkHealth(address string) error {
 		return err
 	}
 	defer func() { _ = conn.Close() }()
+
+	// Opening a gRPC client is lazy. Require an actual SERVING response
+	// before reporting that the operator RPC process is ready.
 	response, err := grpc_health_v1.NewHealthClient(conn).Check(
 		ctx, &grpc_health_v1.HealthCheckRequest{},
 	)

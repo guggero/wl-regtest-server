@@ -18,6 +18,8 @@ type TransactionInputs struct {
 func (b *Bitcoin) BlockTransactions(ctx context.Context,
 	height uint32) ([]TransactionInputs, error) {
 
+	// Resolve the height on the active chain for each poll. A cached block
+	// hash would keep scanning a disconnected branch after a reorg.
 	var hash string
 	if err := b.Call(ctx, "getblockhash", []any{
 		height,
@@ -25,6 +27,10 @@ func (b *Bitcoin) BlockTransactions(ctx context.Context,
 
 		return nil, err
 	}
+
+	// Verbosity two includes input witnesses, which recovery needs to
+	// extract a hashlock preimage without importing every virtual output
+	// into a wallet.
 	var block struct {
 		Transactions []TransactionInputs `json:"tx"`
 	}
@@ -37,6 +43,9 @@ func (b *Bitcoin) BlockTransactions(ctx context.Context,
 func (b *Bitcoin) MempoolSpender(ctx context.Context, txid string,
 	vout uint32) (*TransactionInputs, error) {
 
+	// Query by the exact prevout instead of scanning every mempool
+	// transaction. An absent spender is a normal observation, not a failed
+	// recovery attempt.
 	var spends []struct {
 		TxID string `json:"spendingtxid"`
 	}
@@ -54,6 +63,10 @@ func (b *Bitcoin) MempoolSpender(ctx context.Context, txid string,
 	if len(spends) == 0 || spends[0].TxID == "" {
 		return nil, nil
 	}
+
+	// The spender can leave the mempool between RPCs. Propagate that lookup
+	// failure so the caller can retry or find the confirmed spend in a
+	// block.
 	var tx TransactionInputs
 	if err := b.Call(ctx, "getrawtransaction", []any{
 		spends[0].TxID, true,

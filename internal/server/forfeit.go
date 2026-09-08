@@ -25,10 +25,14 @@ const (
 )
 
 // buildConnectors constructs and signs the deterministic operator-only tree
-// clients reconstruct to bind each forfeit to this exact commitment.
+// clients reconstruct to bind each forfeit to this exact commitment. commitment
+// must already contain the connector funding output at index. The caller saves
+// the mutated round and batch within its enclosing transaction.
 func (s *Server) buildConnectors(r *roundRecord, commitment *wire.MsgTx,
 	index uint32) error {
 
+	// Anchor every connector in this commitment so the associated penalties
+	// become usable only if the replacement batch is published.
 	output := commitment.TxOut[index]
 	t, err := tree.BuildConnectorTree(
 		wire.OutPoint{
@@ -40,6 +44,10 @@ func (s *Server) buildConnectors(r *roundRecord, commitment *wire.MsgTx,
 	if err != nil {
 		return err
 	}
+
+	// Connector branches are operator-only key-path spends. Apply their
+	// BIP86 tweak and verify the whole tree before assigning leaves to
+	// inputs.
 	fetcher, err := t.Root.PrevOutputFetcher(output)
 	if err != nil {
 		return err
@@ -63,6 +71,9 @@ func (s *Server) buildConnectors(r *roundRecord, commitment *wire.MsgTx,
 	if err != nil {
 		return err
 	}
+
+	// Preserve admitted input order when assigning leaves so clients can
+	// reconstruct exactly which connector binds each forfeit.
 	r.Batch.ConnectorLeafMap = make(map[string]*roundpb.ConnectorLeafInfo)
 	for i, leaf := range t.Root.GetLeafNodes() {
 		outpoint, err := leaf.GetNonAnchorOutpoint()
@@ -93,11 +104,16 @@ func (s *Server) buildConnectors(r *roundRecord, commitment *wire.MsgTx,
 }
 
 // SubmitVTXOForfeitSigs verifies and persists connector-bound penalties before
-// permitting the replacement commitment to become broadcastable.
+// permitting the replacement commitment to become broadcastable. It runs inside
+// the mailbox transaction and requires a signed replacement tree when the round
+// creates VTXOs. Retries must preserve the original penalties.
 func (s *Server) SubmitVTXOForfeitSigs(ctx context.Context,
 	req *roundpb.SubmitVTXOForfeitSigsRequest) (*roundpb.ClientSuccessResp,
 	error) {
 
+	// Do not accept surrender of old VTXOs until the replacement exit tree
+	// is signed and the exact connector set has been committed to the
+	// round.
 	id, err := roundID(req.GetRoundId())
 	if err != nil {
 		return nil, err
@@ -115,6 +131,9 @@ func (s *Server) SubmitVTXOForfeitSigs(ctx context.Context,
 			"round not ready for forfeits",
 		)
 	}
+
+	// Require one complete, validated penalty per input; duplicates must
+	// not satisfy the expected forfeit count.
 	signed := make(map[string][]byte)
 	for _, submitted := range req.ForfeitTxs {
 		if submitted == nil {
@@ -141,6 +160,9 @@ func (s *Server) SubmitVTXOForfeitSigs(ctx context.Context,
 		}
 		signed[outpoint.String()] = raw
 	}
+
+	// A retry must reproduce the penalties already retained, since changing
+	// them after commitment signing could invalidate recovery assumptions.
 	if len(r.SignedForfeits) > 0 {
 		for key, raw := range signed {
 			if !bytes.Equal(r.SignedForfeits[key], raw) {
@@ -156,6 +178,10 @@ func (s *Server) SubmitVTXOForfeitSigs(ctx context.Context,
 	if err := s.put(roundKey(r.ID), r); err != nil {
 		return nil, err
 	}
+
+	// A pure refresh or collaborative exit has no boarding signatures left
+	// to collect, so completing forfeits can advance commitment
+	// finalization.
 	if len(r.Request.BoardingRequests) == 0 && len(r.FinalTx) == 0 {
 		_, err := s.SubmitForfeitSigs(
 			ctx, &roundpb.SubmitForfeitSigRequest{
@@ -171,9 +197,14 @@ func (s *Server) SubmitVTXOForfeitSigs(ctx context.Context,
 
 // signForfeit compares the unsigned penalty transaction to the admitted spend
 // path and connector, verifies every participant, and executes both inputs.
+// It returns serialized witness transaction bytes without publishing them.
+// The round must already contain its admitted inputs and assigned connectors.
 func (s *Server) signForfeit(r *roundRecord, submitted *roundpb.ForfeitTxSig,
 	outpoint wire.OutPoint) ([]byte, error) {
 
+	// Resolve the admitted input and its assigned connector from durable
+	// round state; submitted metadata cannot choose another penalty
+	// dependency.
 	connector := r.Batch.ConnectorLeafMap[outpoint.String()]
 	if connector == nil {
 		return nil, errors.New("forfeit input not in round")
@@ -192,6 +223,9 @@ func (s *Server) signForfeit(r *roundRecord, submitted *roundpb.ForfeitTxSig,
 	if record == nil {
 		return nil, errors.New("missing forfeit VTXO")
 	}
+
+	// The owner authorized a specific spend branch when joining. Compare
+	// that branch before using any submitted participant signatures.
 	path, err := arkscript.DecodeSpendPath(submitted.SpendPath)
 	if err != nil {
 		return nil, err
@@ -225,6 +259,10 @@ func (s *Server) signForfeit(r *roundRecord, submitted *roundpb.ForfeitTxSig,
 	if !bytes.Equal(wantedBytes, pathBytes) {
 		return nil, errors.New("forfeit path changed")
 	}
+
+	// Reconstruct the operator destination and connector independently,
+	// then enforce the public forfeit shape, amount, and transaction
+	// version.
 	connectorOutpoint, err := roundpb.OutpointFromProto(
 		connector.LeafOutpoint,
 	)
@@ -256,6 +294,10 @@ func (s *Server) signForfeit(r *roundRecord, submitted *roundpb.ForfeitTxSig,
 
 		return nil, errors.New("incorrect forfeit value or version")
 	}
+
+	// Use indexed VTXO and connector prevouts for signature hashing; values
+	// from the submitted transaction cannot establish the amounts being
+	// spent.
 	packet, err := psbt.NewFromUnsignedTx(&tx)
 	if err != nil {
 		return nil, err
@@ -275,6 +317,9 @@ func (s *Server) signForfeit(r *roundRecord, submitted *roundpb.ForfeitTxSig,
 		return nil, err
 	}
 	leafHash := txscript.NewBaseTapLeaf(path.WitnessScript).TapHash()
+
+	// The legacy single-signature field is unambiguous only for a two-key
+	// policy. More complex leaves require explicit participant identities.
 	signatures := submitted.ParticipantSigs
 	if len(signatures) == 0 {
 		if len(
@@ -325,6 +370,10 @@ func (s *Server) signForfeit(r *roundRecord, submitted *roundpb.ForfeitTxSig,
 			},
 		)
 	}
+
+	// Complete the VTXO script path and the operator connector key path.
+	// Final witness execution below validates all submitted participants
+	// together.
 	if err := signPacketInput(packet, 0, s.key, path); err != nil {
 		return nil, err
 	}
@@ -345,6 +394,9 @@ func (s *Server) signForfeit(r *roundRecord, submitted *roundpb.ForfeitTxSig,
 		return nil, err
 	}
 	packet.Inputs[1].TaprootKeySpendSig = sig.Serialize()
+
+	// Retain a penalty only after both inputs execute successfully, rather
+	// than trusting a syntactically complete collection of signatures.
 	final, err := signedPacket(packet)
 	if err != nil {
 		return nil, err

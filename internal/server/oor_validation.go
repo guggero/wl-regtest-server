@@ -29,11 +29,17 @@ type oorInput struct {
 // validateOOR validates public transaction structure plus the operator's
 // authoritative input set, checkpoint scripts and conserved output value. It
 // does not mutate state or expose signatures.
+// The caller must hold s.mu or have exclusive access to state. Returned
+// bindings refer to the submitted packets and detached indexed records; chain
+// availability and actual signatures require subsequent validation.
 func (s *Server) validateOOR(ark *psbt.Packet, checkpoints []*psbt.Packet,
 	descriptors []oorpb.SigningDescriptor,
 	recipients []oortx.RecipientOutput) (map[chainhash.Hash]*oorInput,
 	error) {
 
+	// Bound package complexity before using the public structural
+	// validator; operator policy and indexed ownership checks remain
+	// separate below.
 	if len(checkpoints) > maxRoundItems ||
 		len(recipients) > maxRoundItems ||
 		len(descriptors) != len(checkpoints) || len(recipients) == 0 {
@@ -43,6 +49,9 @@ func (s *Server) validateOOR(ark *psbt.Packet, checkpoints []*psbt.Packet,
 	if _, err := oortx.ValidateSubmitPackage(ark, checkpoints); err != nil {
 		return nil, err
 	}
+
+	// Match descriptors by spent outpoint rather than arrival order, while
+	// ensuring each checkpoint consumes one distinct descriptor.
 	byOutpoint := make(map[wire.OutPoint]oorpb.SigningDescriptor)
 	for _, descriptor := range descriptors {
 		if _, exists := byOutpoint[descriptor.Outpoint]; exists {
@@ -50,6 +59,9 @@ func (s *Server) validateOOR(ark *psbt.Packet, checkpoints []*psbt.Packet,
 		}
 		byOutpoint[descriptor.Outpoint] = descriptor
 	}
+
+	// Resolve every checkpoint to a live indexed coin before accumulating
+	// value; a well-formed package alone does not establish funding.
 	inputs := make(map[chainhash.Hash]*oorInput)
 	var inputValue int64
 	for _, packet := range checkpoints {
@@ -79,6 +91,10 @@ func (s *Server) validateOOR(ark *psbt.Packet, checkpoints []*psbt.Packet,
 		}
 		inputValue += value
 	}
+
+	// Every non-anchor output must match its recipient declaration and
+	// compiled policy, with no undeclared destination consuming input
+	// value.
 	if len(recipients) != len(ark.UnsignedTx.TxOut)-1 {
 		return nil, errors.New(
 			"recipient count differs from Ark outputs",
@@ -106,6 +122,9 @@ func (s *Server) validateOOR(ark *psbt.Packet, checkpoints []*psbt.Packet,
 		}
 		outputValue += output.Value
 	}
+
+	// This fixture subsidizes on-chain fees separately; the virtual
+	// transfer itself must conserve the entire admitted input value.
 	if inputValue != outputValue {
 		return nil, errors.New(
 			"OOR transaction does not conserve value",
@@ -121,6 +140,10 @@ func (s *Server) outputPolicy(raw []byte) (*arkscript.PolicyTemplate, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Compilation alone accepts policies outside this operator's terms.
+	// Validate operator participation and the minimum unilateral exit
+	// delay.
 	nodes := make([]arkscript.Node, len(policy.Leaves))
 	for i, leaf := range policy.Leaves {
 		nodes[i] = leaf.Node
@@ -138,9 +161,13 @@ func (s *Server) outputPolicy(raw []byte) (*arkscript.PolicyTemplate, error) {
 
 // validateOORInput binds signing paths to persisted policy and reconstructs
 // the checkpoint output independently of client-supplied PSBT metadata.
+// The caller must first enforce the public package shape and one-input
+// checkpoint structure, and must hold s.mu while consulting indexed state.
 func (s *Server) validateOORInput(packet *psbt.Packet,
 	descriptor oorpb.SigningDescriptor) (*oorInput, error) {
 
+	// Only live, unreserved coins with enough exit runway can enter a new
+	// session. Indexed status prevents competing off-chain spends.
 	record, err := get[vtxoRecord](s, "vtxo/"+descriptor.Outpoint.String())
 	if err != nil {
 		return nil, err
@@ -154,6 +181,9 @@ func (s *Server) validateOORInput(packet *psbt.Packet,
 	if _, exists := s.state.Records["reserved/"+descriptor.Outpoint.String()]; exists {
 		return nil, errors.New("input VTXO is reserved")
 	}
+
+	// Bind client PSBT metadata to the authoritative coin before it reaches
+	// Taproot hashing; altered amounts or scripts would change the digest.
 	previous := packet.Inputs[0].WitnessUtxo
 	if previous == nil || previous.Value != int64(record.VTXO.ValueSat) ||
 		!bytes.Equal(previous.PkScript, record.VTXO.PkScript) ||
@@ -163,6 +193,10 @@ func (s *Server) validateOORInput(packet *psbt.Packet,
 			"input does not match authoritative VTXO",
 		)
 	}
+
+	// The checkpoint must spend through a real leaf requiring this
+	// operator, not merely carry a plausible script supplied by the
+	// requester.
 	policy, err := arkscript.DecodePolicyTemplate(record.Policy)
 	if err != nil {
 		return nil, err
@@ -178,6 +212,9 @@ func (s *Server) validateOORInput(packet *psbt.Packet,
 	if err != nil || !hasKey(keys, s.key.PubKey()) {
 		return nil, errors.New("checkpoint spend must include operator")
 	}
+
+	// Checkpoint ownership may retain a subset of the original signers, but
+	// must include both the operator and an owner from that original set.
 	owner, err := arkscript.DecodeLeafTemplate(descriptor.OwnerLeafPolicy)
 	if err != nil {
 		return nil, err
@@ -197,6 +234,10 @@ func (s *Server) validateOORInput(packet *psbt.Packet,
 			)
 		}
 	}
+
+	// Rebuild the checkpoint using the public construction so its timeout
+	// and owner branches cannot be substituted through PSBT output
+	// metadata.
 	result, err := checkpoint.BuildPSBT(arkscript.CheckpointPolicy{
 		OperatorKey: s.key.PubKey(), CSVDelay: checkpoint.MinCheckpointCSVDelay,
 	}, checkpoint.Input{
@@ -218,6 +259,9 @@ func (s *Server) validateOORInput(packet *psbt.Packet,
 			"checkpoint differs from operator construction",
 		)
 	}
+
+	// Return the operator-reconstructed owner branch for signing the Ark
+	// spend, ensuring both stages use the same checkpoint commitment.
 	leaf, err := oortx.BuildTaprootTapLeafScript(
 		result.TapTreeEncoded, result.OwnerLeafScript,
 	)

@@ -30,10 +30,16 @@ func (m mailboxArk) GetInfo(_ context.Context,
 
 // info snapshots advertised terms while the caller holds the state lock.
 func (s *Server) info(req *arkrpc.GetInfoRequest) *arkrpc.GetInfoResponse {
+	// Version zero signals no overlap; advertising terms must not silently
+	// select version one when a client has not offered it.
 	var selected uint32
 	if slices.Contains(req.SupportedArkVersions, uint32(1)) {
 		selected = 1
 	}
+
+	// Advertise the same limits the transaction handlers enforce. FeeRate
+	// is a regtest estimate; the operator subsidizes actual mining costs
+	// from its wallet.
 	return &arkrpc.GetInfoResponse{
 		Version: "wl-regtest-server/0.1", Pubkey: s.key.PubKey().SerializeCompressed(),
 		Network: "regtest", BlockHeight: s.height,
@@ -46,7 +52,10 @@ func (s *Server) info(req *arkrpc.GetInfoRequest) *arkrpc.GetInfoResponse {
 	}
 }
 
-// EstimateFee describes the subsidy policy used by regtest rounds.
+// EstimateFee returns the zero-service-fee regtest quote and minimum viable
+// output in satoshis. Positive amounts below that minimum receive a warning;
+// nonpositive amounts are invalid. This does not reserve liquidity or guarantee
+// that a later round can obtain wallet inputs.
 func (s *Server) EstimateFee(_ context.Context,
 	req *arkrpc.EstimateFeeRequest) (*arkrpc.EstimateFeeResponse, error) {
 
@@ -55,6 +64,10 @@ func (s *Server) EstimateFee(_ context.Context,
 			codes.InvalidArgument, "positive amount required",
 		)
 	}
+
+	// An estimate may describe a sub-minimum payment so the client can
+	// offer credit handling, even though an ordinary VTXO output would be
+	// rejected.
 	return &arkrpc.EstimateFeeResponse{
 		MinViableAmountSat: s.cfg.MinAmount,
 		BelowDustWarning:   req.AmountSat < s.cfg.MinAmount,

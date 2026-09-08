@@ -15,6 +15,9 @@ func (s *Server) releaseCreditReservation(id, reason string) error {
 	if id == "" {
 		return nil
 	}
+
+	// Operation state makes release idempotent: a debit or earlier release
+	// must never subtract the same reservation a second time.
 	credit, err := get[creditRecord](s, "credit-operation/"+id)
 	if err != nil {
 		return err
@@ -25,6 +28,9 @@ func (s *Server) releaseCreditReservation(id, reason string) error {
 	if credit.Operation.State != swaprpc.CreditOperationState_CREDIT_OPERATION_STATE_RESERVED {
 		return nil
 	}
+
+	// Check the account invariant before subtraction, then save account and
+	// operation state together in the caller's transaction.
 	account, err := s.account(credit.Account)
 	if err != nil {
 		return err
@@ -48,6 +54,9 @@ func (s *Server) releaseCreditReservation(id, reason string) error {
 // instead reconcile the authoritative Lightning result, even after their quote
 // expires.
 func (s *Server) expireAwaitingSwaps(ctx context.Context) error {
+	// Serialize expiry with funding observation so a swap cannot begin
+	// payment while its credit reservation is simultaneously being
+	// released.
 	return s.transact(ctx, func() error {
 		for key := range s.state.Records {
 			if !strings.HasPrefix(key, "in-swap/") {

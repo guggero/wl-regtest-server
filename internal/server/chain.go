@@ -15,7 +15,11 @@ import (
 // checkVTXORoots requires every real commitment backing a VTXO to remain
 // confirmed and unspent. A root already being unrolled is conservatively
 // excluded from new operator-assisted transfers, including sibling branches.
+// record must contain indexed ancestry. This checks root availability only;
+// spend-path timelocks and signatures are validated separately.
 func (s *Server) checkVTXORoots(ctx context.Context, record *vtxoRecord) error {
+	// Every ancestry root is a dependency: one unavailable root makes the
+	// whole off-chain transfer unsafe, even if other roots are still live.
 	for _, path := range record.VTXO.AncestryPaths {
 		if path == nil || path.TreePath == nil ||
 			path.TreePath.BatchOutpoint == nil ||
@@ -40,9 +44,13 @@ func (s *Server) checkVTXORoots(ctx context.Context, record *vtxoRecord) error {
 // validateOORChain checks Bitcoin's current backing coins and chain timelocks
 // before any operator signature is released. Pure packet validation separately
 // verifies the policy, values, scripts and participant signatures.
+// The caller must hold s.mu and supply bindings from validateOOR. Only block
+// relative locks are supported; time-based CSV locks are rejected.
 func (s *Server) validateOORChain(ctx context.Context,
 	inputs map[chainhash.Hash]*oorInput) error {
 
+	// Chain availability and timelocks are checked together so a valid
+	// script cannot authorize an off-chain transfer before it is spendable.
 	for _, input := range inputs {
 		if err := s.checkVTXORoots(ctx, input.Record); err != nil {
 			return err
@@ -82,6 +90,8 @@ func backendNotFound(err error) bool {
 // inputs already consumed by OOR or a signed forfeit. Backend reads happen
 // outside the persistence lock and updates recheck the current input status.
 func (s *Server) pollVTXOChain(ctx context.Context) error {
+	// Copy only chain-dependent states under the lock. Spent and forfeited
+	// coins are protocol decisions that a reorg must never undo.
 	s.mu.Lock()
 	records := make(map[string]*vtxoRecord)
 	height := s.height
@@ -100,6 +110,10 @@ func (s *Server) pollVTXOChain(ctx context.Context) error {
 		}
 	}
 	s.mu.Unlock()
+
+	// Backend calls run without blocking mailbox transactions. Cache shared
+	// roots so siblings use the same observation within this
+	// reconciliation.
 	roots := make(map[wire.OutPoint]arkrpc.VTXOStatus)
 	updates := make(map[string]arkrpc.VTXOStatus)
 	for key, r := range records {
@@ -120,6 +134,9 @@ func (s *Server) pollVTXOChain(ctx context.Context) error {
 			}
 			root, ok := roots[op]
 			if !ok {
+				// An absent UTXO alone cannot distinguish a
+				// spent root from a disconnected funding
+				// transaction; consult the creator when needed.
 				coin, err := s.cfg.Bitcoin.UTXO(ctx, op)
 				switch {
 				case err == nil && coin.Confirmations > 0:
@@ -129,6 +146,10 @@ func (s *Server) pollVTXOChain(ctx context.Context) error {
 					root = arkrpc.VTXOStatus_VTXO_STATUS_UNCONFIRMED
 
 				case errors.Is(err, backend.ErrOutputSpent):
+					// A confirmed creator with no unspent
+					// output means unrolling has started.
+					// An unknown or unconfirmed creator
+					// instead suspends use.
 					confs, _, err := s.cfg.Bitcoin.Transaction(ctx, op.Hash.String())
 					if err != nil && !backendNotFound(err) {
 						return err
@@ -148,6 +169,10 @@ func (s *Server) pollVTXOChain(ctx context.Context) error {
 				state = root
 			}
 		}
+
+		// Reserve the advertised exit window before operator recovery
+		// becomes possible; no new transfer should depend on an
+		// expiring commitment.
 		if r.VTXO.BatchExpiryHeight <= int32(
 			height+s.cfg.ExitDelay,
 		) {
@@ -161,6 +186,9 @@ func (s *Server) pollVTXOChain(ctx context.Context) error {
 	if len(updates) == 0 {
 		return nil
 	}
+
+	// Recheck the observed status while committing: a concurrent OOR or
+	// forfeit may have consumed the coin during the backend queries.
 	return s.transact(ctx, func() error {
 		for key, state := range updates {
 			current, err := get[vtxoRecord](s, key)

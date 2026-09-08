@@ -27,6 +27,9 @@ func expirySweepFixture(t *testing.T) (*Server, *roundRecord, *psbt.Packet,
 	*backend.Coin) {
 
 	t.Helper()
+
+	// Use the public branch-root construction and the production key
+	// derivation so witness checks exercise the actual CSV timeout leaf.
 	s := testServer(t, t.TempDir())
 	round := &roundRecord{ID: "expiry-test", Batch: &roundpb.ClientBatchInfo{
 		SweepDelay: 10,
@@ -40,6 +43,10 @@ func expirySweepFixture(t *testing.T) (*Server, *roundRecord, *psbt.Packet,
 		s.deriveKey(round.ID+"/sweep").PubKey(), round.Batch.SweepDelay,
 	)
 	require.NoError(t, err)
+
+	// An offline synthetic commitment is sufficient for script tests; the
+	// Bitcoin integration test replaces its outpoint with real wallet
+	// funding.
 	tx := wire.NewMsgTx(2)
 	tx.AddTxIn(wire.NewTxIn(&wire.OutPoint{}, nil, nil))
 	tx.AddTxOut(spec.Output)
@@ -57,6 +64,8 @@ func expirySweepFixture(t *testing.T) (*Server, *roundRecord, *psbt.Packet,
 // TestExpirySweepWitness verifies that expiry recovery binds the real branch
 // script and CSV delay, and rejects a changed operator timeout key.
 func TestExpirySweepWitness(t *testing.T) {
+	// Check the timeout witness locally with the original delay and value,
+	// then change the round identity to force a mismatching recovery key.
 	s, round, packet, coin := expirySweepFixture(t)
 	raw, err := s.buildExpirySweep(
 		round, packet, coin, coin.Output.PkScript,
@@ -78,6 +87,9 @@ func TestExpirySweepBitcoin(t *testing.T) {
 	if os.Getenv("WL_INTEGRATION") != "1" {
 		t.Skip("set WL_INTEGRATION=1 with a funded regtest RPC wallet")
 	}
+
+	// This opt-in test spends real regtest wallet funds and changes chain
+	// state, so confirm the backend network before funding the branch root.
 	s, round, packet, coin := expirySweepFixture(t)
 	bitcoin := &backend.Bitcoin{
 		URL: os.Getenv(
@@ -103,6 +115,9 @@ func TestExpirySweepBitcoin(t *testing.T) {
 		coin.Output.PkScript[2:], &chaincfg.RegressionNetParams,
 	)
 	require.NoError(t, err)
+
+	// Fund the exact branch script through Bitcoin Core, then discover its
+	// actual output index rather than relying on wallet output ordering.
 	var txid, miner string
 	require.NoError(t, bitcoin.Call(t.Context(), "sendtoaddress", []any{
 		root.EncodeAddress(), float64(coin.Output.Value) / 1e8,
@@ -163,6 +178,9 @@ func TestExpirySweepBitcoin(t *testing.T) {
 		}, nil,
 	))
 	require.NoError(t, s.checkVTXORoots(t.Context(), record))
+
+	// Reuse identical signed sweep bytes on both sides of CSV maturity;
+	// only chain age should determine mempool acceptance.
 	raw, err := s.buildExpirySweep(
 		round, packet, coin, coin.Output.PkScript,
 	)
@@ -182,6 +200,9 @@ func TestExpirySweepBitcoin(t *testing.T) {
 	check()
 	require.False(t, acceptance[0].Allowed)
 	require.Equal(t, "non-BIP68-final", acceptance[0].Reason)
+
+	// Mine exactly the missing confirmations to cross the relative-lock
+	// boundary, then verify the same transaction is accepted and confirms.
 	require.NoError(t, bitcoin.Call(
 		t.Context(), "generatetoaddress",
 		[]any{round.Batch.SweepDelay - 1, miner}, nil,

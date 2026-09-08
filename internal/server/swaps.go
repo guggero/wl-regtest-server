@@ -39,8 +39,11 @@ const (
 	paymentTimeout = 30 * time.Second
 )
 
-// inSwap retains the negotiated policy, funding observation and irreversible
-// LND outcome. A failed attempt is never retried after refund authorization.
+// inSwap tracks an Ark-to-Lightning send from the wallet's perspective.
+// awaiting-funding waits for the sender's vHTLC, paying reconciles the
+// Lightning outcome, and claiming recovers treasury value with the returned
+// preimage. Direct same-Ark sends use in-ark while waiting for the receiver's
+// claim. A failed attempt is never retried after refund authorization.
 type inSwap struct {
 	Request      *swaprpc.CreateInSwapRequest
 	Response     *swaprpc.CreateInSwapResponse
@@ -70,6 +73,9 @@ func (s *Server) decodeInvoice(encoded string) (*zpay32.Invoice, uint64,
 			codes.InvalidArgument, "invoice too long",
 		)
 	}
+
+	// Decode against regtest and require whole satoshis because Ark outputs
+	// and credit balances cannot represent a fractional-satoshi invoice.
 	invoice, err := zpay32.Decode(encoded, &chaincfg.RegressionNetParams)
 	if err != nil {
 		return nil, 0, status.Error(
@@ -85,6 +91,9 @@ func (s *Server) decodeInvoice(encoded string) (*zpay32.Invoice, uint64,
 			"positive whole-satoshi invoice required",
 		)
 	}
+
+	// Admission must not initiate payment of an already expired invoice;
+	// quote and execution both use this check to avoid divergent terms.
 	if !s.cfg.Clock.Now().Before(invoice.Timestamp.Add(
 		invoice.Expiry(),
 	)) {
@@ -98,12 +107,17 @@ func (s *Server) decodeInvoice(encoded string) (*zpay32.Invoice, uint64,
 
 // creditQuote applies only authorized credit and keeps any residual vHTLC at
 // the advertised minimum. Dust invoices require their full amount in credits.
+// All arguments and result amounts are satoshis; maximum is the caller's
+// authorized cap, not an instruction to consume every available credit.
 func (s *Server) creditQuote(
 	amount, available, maximum uint64) *swaprpc.CreditQuote {
 
 	q := &swaprpc.CreditQuote{ArkFundingSat: amount}
 	limit := min(available, maximum)
 	floor := uint64(s.cfg.MinAmount)
+
+	// A subminimum invoice cannot be represented by a vHTLC at all. Report
+	// its credit shortfall and a top-up large enough to form an Ark output.
 	if amount < floor {
 		q.MustUseCredit = true
 		q.CreditAppliedSat = min(amount, limit)
@@ -114,6 +128,9 @@ func (s *Server) creditQuote(
 		}
 		return q
 	}
+
+	// Full credit funding needs no virtual output; partial credit must
+	// leave at least the minimum amount in the sender-funded vHTLC.
 	if limit >= amount {
 		q.CreditAppliedSat = amount
 		q.ArkFundingSat = 0
@@ -126,6 +143,8 @@ func (s *Server) creditQuote(
 
 // QuoteInSwap previews the same funding split used for admission without
 // reserving credits or exposing any signing artifact.
+// Invoice amounts must be whole satoshis on regtest. Accessing an account
+// requires its request-bound authorization, whose nonce binding is persisted.
 func (s *Server) QuoteInSwap(ctx context.Context,
 	req *swaprpc.QuoteInSwapRequest) (*swaprpc.QuoteInSwapResponse, error) {
 
@@ -133,6 +152,10 @@ func (s *Server) QuoteInSwap(ctx context.Context,
 	if err != nil {
 		return nil, err
 	}
+
+	// Read available credits under authorization and the state lock, then
+	// use the same split calculation as admission without reserving the
+	// result.
 	var resp *swaprpc.QuoteInSwapResponse
 	err = s.transact(ctx, func() error {
 		var available uint64
@@ -158,6 +181,9 @@ func (s *Server) QuoteInSwap(ctx context.Context,
 			return err
 		}
 
+		// Describe the actual funding path: direct same-Ark settlement
+		// applies only when neither participant contributes credits
+		// requiring a treasury bridge.
 		settlement := swaprpc.SettlementType_SETTLEMENT_TYPE_LIGHTNING
 		if quote.CreditAppliedSat == amount {
 			settlement = swaprpc.SettlementType_SETTLEMENT_TYPE_CREDIT
@@ -188,7 +214,9 @@ func minTime(a, b time.Time) time.Time {
 }
 
 // swapPolicy reconstructs the public six-leaf vHTLC with independent swap
-// participant and operator keys.
+// participant and operator keys. hash must be 32 bytes and cfg non-nil.
+// RefundLocktime is an absolute block height; unilateral delays are relative
+// block counts from the negotiated terms.
 func (s *Server) swapPolicy(sender, receiver *btcec.PublicKey, hash []byte,
 	cfg *swaprpc.VHTLCConfig) (*arkscript.VHTLCPolicy, error) {
 
@@ -204,10 +232,15 @@ func (s *Server) swapPolicy(sender, receiver *btcec.PublicKey, hash []byte,
 
 // CreateInSwap admits one payment hash, reserves its credit share, and returns
 // the immutable vHTLC terms. Credit-only calls wait for real LND settlement.
+// The payment hash fixes invoice, client key, fee cap and credit cap across
+// retries. Canceling a waiting credit-only RPC leaves the durable payment
+// active; a later retry can recover its outcome.
 func (s *Server) CreateInSwap(ctx context.Context,
 	req *swaprpc.CreateInSwapRequest) (*swaprpc.CreateInSwapResponse,
 	error) {
 
+	// Fix invoice amount, network, expiry, and the sender key before
+	// reserving credit or negotiating a conditional funding output.
 	invoice, amount, err := s.decodeInvoice(req.GetInvoice())
 	if err != nil {
 		return nil, err
@@ -234,6 +267,10 @@ func (s *Server) CreateInSwap(ctx context.Context,
 				"credit account required",
 			)
 		}
+
+		// A payment hash identifies one immutable attempt. Retrying may
+		// recover its original terms but may not redirect funds or
+		// alter the credit split.
 		old, err := get[inSwap](s, "in-swap/"+id)
 		if err != nil {
 			return err
@@ -253,6 +290,10 @@ func (s *Server) CreateInSwap(ctx context.Context,
 			response = old.Response
 			return nil
 		}
+
+		// Compute and reserve against the same balance snapshot so
+		// simultaneous payments cannot both consume the quoted
+		// available credit.
 		a, err := s.account(account)
 		if err != nil {
 			return err
@@ -266,6 +307,10 @@ func (s *Server) CreateInSwap(ctx context.Context,
 				"credit top-up required",
 			)
 		}
+
+		// External payments use a server-owned claim key. A direct
+		// same-Ark payment instead names the actual receiver, who alone
+		// knows the preimage.
 		receiver := s.deriveKey("swap-receiver/" + id)
 		receiverPub := receiver.PubKey()
 		local, err := s.sameArkInvoice(invoice, amount)
@@ -289,6 +334,9 @@ func (s *Server) CreateInSwap(ctx context.Context,
 			}
 		}
 
+		// Freeze absolute and relative refund terms at admission; the
+		// saved policy must remain reconstructible when a payment
+		// completes or fails later.
 		cfg := &swaprpc.VHTLCConfig{RefundLocktime: s.height + swapRefundBlocks, UnilateralClaimDelay: s.cfg.ExitDelay,
 			UnilateralRefundDelay: s.cfg.ExitDelay * 2, UnilateralRefundWithoutReceiverDelay: s.cfg.ExitDelay * 3, SwapserverPubkey: receiver.PubKey().SerializeCompressed()}
 		response = &swaprpc.CreateInSwapResponse{PaymentHash: invoice.PaymentHash[:], AmountSat: quote.ArkFundingSat, ServerPubkey: receiverPub.SerializeCompressed(), VhtlcConfig: cfg,
@@ -309,6 +357,9 @@ func (s *Server) CreateInSwap(ctx context.Context,
 			response.SettlementType = swaprpc.SettlementType_SETTLEMENT_TYPE_IN_ARK
 			cfg.SwapserverPubkey = sender.SerializeCompressed()
 		}
+
+		// Reserve the credit share until an authoritative payment
+		// outcome either consumes it or proves it safe to release.
 		if quote.CreditAppliedSat > 0 {
 			a.Reserved += quote.CreditAppliedSat
 			if err := s.put(
@@ -329,6 +380,10 @@ func (s *Server) CreateInSwap(ctx context.Context,
 				return err
 			}
 		}
+
+		// Credit-only payments can begin immediately. Other payments
+		// must first receive an exact indexed vHTLC matching these
+		// negotiated policy bytes.
 		if quote.ArkFundingSat == 0 {
 			response.SettlementType = swaprpc.SettlementType_SETTLEMENT_TYPE_CREDIT
 			r.Phase = "paying"
@@ -358,6 +413,11 @@ func (s *Server) CreateInSwap(ctx context.Context,
 				return err
 			}
 		}
+
+		// Bind local receiver state to this payer in the same
+		// transaction. Credit-bearing transfers need separate treasury
+		// funding, while direct transfers wait for the sender's own
+		// conditional output.
 		if r.Bridge {
 			if local.Phase != "registered" {
 				return status.Error(
@@ -388,6 +448,10 @@ func (s *Server) CreateInSwap(ctx context.Context,
 	if response.SettlementType != swaprpc.SettlementType_SETTLEMENT_TYPE_CREDIT {
 		return response, nil
 	}
+
+	// Credit-only callers need the settlement preimage in the RPC result.
+	// Wait on committed state changes; cancellation does not cancel the
+	// durable pay.
 	for {
 		s.mu.Lock()
 		current, err := get[inSwap](s, "in-swap/"+id)
@@ -417,6 +481,9 @@ func (s *Server) CreateInSwap(ctx context.Context,
 // and chain polling, so receiving and claiming remain responsive during pays.
 func (s *Server) runSwaps() {
 	defer s.wg.Done()
+
+	// Keep blocking payment streams off the mailbox and chain worker.
+	// Shutdown cancels their parent context and joins this owned worker.
 	for {
 		select {
 		case <-s.ctx.Done():
@@ -435,6 +502,8 @@ func (s *Server) runSwaps() {
 // pollInSwaps binds exact indexed funding before permitting an LND payment and
 // claims successful payments with their real preimage.
 func (s *Server) pollInSwaps(ctx context.Context) error {
+	// Snapshot unresolved attempts without retaining the lock across LND
+	// streams; terminal failures must never become new routing attempts.
 	s.mu.Lock()
 	var ids []string
 	for key := range s.state.Records {
@@ -471,6 +540,10 @@ func (s *Server) pollInSwaps(ctx context.Context) error {
 
 				return nil
 			}
+
+			// Recognize funding by live indexed value, script, and
+			// policy together. A script match alone cannot
+			// establish the negotiated payment amount.
 			for key := range s.state.Records {
 				if !strings.HasPrefix(key, "vtxo/") {
 					continue
@@ -487,6 +560,12 @@ func (s *Server) pollInSwaps(ctx context.Context) error {
 						key, "vtxo/",
 					)
 					r.Phase = "paying"
+
+					// A direct payment already funds the
+					// receiver's claim output; announce
+					// that exact outpoint instead of
+					// routing a Lightning payment back to
+					// ourselves.
 					if r.InArk {
 						local, err := get[outSwap](
 							s, "out-swap/"+id,
@@ -536,6 +615,9 @@ func (s *Server) pollInSwaps(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+
+		// Same-Ark completion is proven by the receiver's finalized
+		// claim witness, not by an unverified preimage message.
 		if r.Phase == "in-ark" {
 			if err := s.transact(ctx, func() error {
 				current, err := get[inSwap](s, "in-swap/"+id)
@@ -563,6 +645,10 @@ func (s *Server) pollInSwaps(ctx context.Context) error {
 				return err
 			}
 		}
+
+		// Resolve payment outside the state lock, then commit only if
+		// the saved attempt is still paying. Transient RPC errors leave
+		// it recoverable.
 		if r.Phase == "paying" {
 			var payment *lnrpc.Payment
 			var err error
@@ -582,6 +668,11 @@ func (s *Server) pollInSwaps(ctx context.Context) error {
 				if current.Phase != "paying" {
 					return nil
 				}
+
+				// Check the disclosed secret against the
+				// negotiated hash before authorizing the
+				// treasury claim or returning credit-only
+				// success.
 				if payment.Status == lnrpc.Payment_SUCCEEDED {
 					preimage, err := hex.DecodeString(
 						payment.PaymentPreimage,
@@ -618,6 +709,11 @@ func (s *Server) pollInSwaps(ctx context.Context) error {
 				} else {
 					return nil
 				}
+
+				// The terminal routing outcome determines the
+				// ledger movement: failed payments release
+				// reserved value, successful ones consume it
+				// exactly once.
 				if current.CreditID != "" {
 					credit, err := get[creditRecord](
 						s,
@@ -679,6 +775,10 @@ func (s *Server) pollInSwaps(ctx context.Context) error {
 				return err
 			}
 		}
+
+		// After successful payment, materialize a real claim using the
+		// verified preimage and original vHTLC terms before marking the
+		// swap complete.
 		if err := s.transact(ctx, func() error {
 			current, err := get[inSwap](s, "in-swap/"+id)
 			if err != nil {
@@ -735,6 +835,8 @@ func (s *Server) pollInSwaps(ctx context.Context) error {
 
 // payInvoice resumes a persisted LND payment by hash before considering a new
 // attempt. A terminal failure remains terminal so cooperative refunds are safe.
+// The caller must have durably entered paying and must not hold s.mu.
+// Transport errors leave the result ambiguous and must not authorize a refund.
 func (s *Server) payInvoice(ctx context.Context, r *inSwap) (*lnrpc.Payment,
 	error) {
 
@@ -742,6 +844,10 @@ func (s *Server) payInvoice(ctx context.Context, r *inSwap) (*lnrpc.Payment,
 		ctx, paymentTimeout+backend.RPCTimeout,
 	)
 	defer cancel()
+
+	// A previous call may have paid before losing its RPC response. Query
+	// LND's durable payment history first so recovery cannot pay the
+	// invoice twice.
 	stream, err := s.cfg.LND.Router.TrackPaymentV2(
 		ctx, &routerrpc.TrackPaymentRequest{
 			PaymentHash:       r.Response.PaymentHash,
@@ -755,6 +861,9 @@ func (s *Server) payInvoice(ctx context.Context, r *inSwap) (*lnrpc.Payment,
 		}
 		err = recvErr
 	}
+
+	// Only an authoritative absence allows a new attempt. A terminal failed
+	// payment returned above stays failed so refund signatures remain safe.
 	if status.Code(err) != codes.NotFound {
 		return nil, err
 	}
@@ -793,6 +902,10 @@ func (s *Server) sameArkInvoice(invoice *zpay32.Invoice,
 	if err != nil || r == nil {
 		return nil, err
 	}
+
+	// Match the registered virtual channel as well as hash and amount; a
+	// local hash by itself does not establish that this invoice uses our
+	// receive route.
 	matched := false
 	for _, route := range invoice.RouteHints {
 		if len(route) > 0 &&
@@ -822,6 +935,9 @@ func (s *Server) sameArkInvoice(invoice *zpay32.Invoice,
 func (s *Server) payInternal(ctx context.Context, id string) (*lnrpc.Payment,
 	error) {
 
+	// Create receiver funding once under the state lock. Later polls report
+	// its saved outcome while the ordinary receive worker observes the
+	// claim.
 	err := s.transact(ctx, func() error {
 		r, err := get[outSwap](s, "out-swap/"+id)
 		if err != nil {
@@ -833,6 +949,10 @@ func (s *Server) payInternal(ctx context.Context, id string) (*lnrpc.Payment,
 		if r.Phase != "awaiting-internal" {
 			return nil
 		}
+
+		// A credit-bearing local payment uses a treasury sender key,
+		// separating the receiver's conditional funds from the payer's
+		// credit or vHTLC contribution.
 		sender := s.deriveKey("swap-sender/" + id)
 		receiver, err := btcec.ParsePubKey(r.Request.ClientVhtlcPubkey)
 		if err != nil {
@@ -867,6 +987,10 @@ func (s *Server) payInternal(ctx context.Context, id string) (*lnrpc.Payment,
 			SenderPubkey: sender.PubKey().SerializeCompressed(),
 			VhtlcConfig:  r.Config,
 		}
+
+		// Attached receiver credits require consent to the combined
+		// terms before funding. Without attached credits the treasury
+		// can issue the output immediately.
 		if r.Response.AttachedCreditSat > 0 {
 			event.RequestedAmountSat = r.Request.AmountSat
 			event.AttachedCreditSat = r.Response.AttachedCreditSat
@@ -898,6 +1022,9 @@ func (s *Server) payInternal(ctx context.Context, id string) (*lnrpc.Payment,
 		return nil, err
 	}
 
+	// Translate durable receive state into the payment outcome consumed by
+	// the payer worker; the preimage still comes only from a verified
+	// claim.
 	s.mu.Lock()
 	r, err := get[outSwap](s, "out-swap/"+id)
 	s.mu.Unlock()

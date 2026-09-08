@@ -20,7 +20,9 @@ import (
 	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
-// testServer restores an offline server without starting backend workers.
+// testServer opens or restores an offline server in dir without starting
+// backend workers. It registers cleanup for the store; callers must configure
+// any backend methods they exercise and serialize direct state access.
 func testServer(t *testing.T, dir string) *Server {
 	t.Helper()
 	cfg := DefaultConfig()
@@ -35,6 +37,8 @@ func testServer(t *testing.T, dir string) *Server {
 // TestMailboxClientEvents exercises the public actor's one-way envelope shape,
 // including its absent correlation ID and heartbeat's absent body.
 func TestMailboxClientEvents(t *testing.T) {
+	// Use the public one-way actor envelope, which has no correlation ID,
+	// to verify admission does not incorrectly require ordinary RPC fields.
 	dir := t.TempDir()
 	s := testServer(t, dir)
 	key, err := btcec.NewPrivateKey()
@@ -51,6 +55,10 @@ func TestMailboxClientEvents(t *testing.T) {
 	}}
 	_, err = s.Send(mailboxContext(t, key, target), req)
 	require.NoError(t, err)
+
+	// Restart between admission and dispatch, then resend the event to
+	// prove the durable inbox executes it once and emits one domain
+	// notification.
 	require.NoError(t, s.Stop())
 	s = testServer(t, dir)
 	executed := 0
@@ -66,6 +74,9 @@ func TestMailboxClientEvents(t *testing.T) {
 	require.NoError(t, s.dispatchPending(t.Context()))
 	require.Equal(t, 1, executed)
 	require.Len(t, s.state.Mail[id].Messages, 1)
+
+	// Heartbeats omit both body and idempotency key, and must not enlarge
+	// the durable request ledger despite being valid authenticated events.
 	heartbeat := proto.Clone(req).(*mailboxpb.SendRequest)
 	heartbeat.Envelope.Body = nil
 	heartbeat.Envelope.IdempotencyKey = ""
@@ -74,6 +85,9 @@ func TestMailboxClientEvents(t *testing.T) {
 	_, err = s.Send(mailboxContext(t, key, target), heartbeat)
 	require.NoError(t, err)
 	require.Len(t, s.state.Requests, 1)
+
+	// Exercise the mailbox-specific GetInfo handler inside a transaction;
+	// it must use the existing lock rather than trying to acquire it again.
 	info, err := marshal(&arkrpc.GetInfoRequest{
 		SupportedArkVersions: []uint32{
 			1,
@@ -112,6 +126,8 @@ func mailboxContext(t *testing.T, key *btcec.PrivateKey,
 // executes once, and retains replay protection after its response is
 // acknowledged.
 func TestMailboxRecovery(t *testing.T) {
+	// Prepare an authenticated request with stable semantic identity so
+	// recovery can distinguish a retry from a second operation.
 	dir := t.TempDir()
 	s := testServer(t, dir)
 	key, err := btcec.NewPrivateKey()
@@ -135,6 +151,10 @@ func TestMailboxRecovery(t *testing.T) {
 	require.Equal(t, codes.Unauthenticated, status.Code(err))
 	_, err = s.Send(mailboxContext(t, key, target), req)
 	require.NoError(t, err)
+
+	// Replace the process after durable admission but before handler work;
+	// the recovered dispatcher must retain the sender's authenticated
+	// identity.
 	require.NoError(t, s.Stop())
 	s = testServer(t, dir)
 	executed := 0
@@ -150,6 +170,9 @@ func TestMailboxRecovery(t *testing.T) {
 		},
 	)
 	require.NoError(t, s.dispatchPending(context.Background()))
+
+	// Pull and acknowledge the response before retrying, ensuring replay
+	// protection survives removal of the original mailbox envelope.
 	readCtx := mailboxContext(t, key, id)
 	pulled, err := s.Pull(readCtx, &mailboxpb.PullRequest{MailboxId: id})
 	require.NoError(t, err)
@@ -168,6 +191,9 @@ func TestMailboxRecovery(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, pulled.Envelopes, 1)
 	require.Equal(t, uint64(2), pulled.Envelopes[0].EventSeq)
+
+	// A reused idempotency key cannot change the effect, and authorization
+	// for the server mailbox cannot be used to read the sender's mailbox.
 	changed := proto.Clone(req).(*mailboxpb.SendRequest)
 	changed.Envelope.Body, err = anypb.New(wrapperspb.String(
 		"credit-twice",
@@ -184,6 +210,8 @@ func TestMailboxRecovery(t *testing.T) {
 // TestTransitionRollback checks that neither state nor egress becomes visible
 // when a transaction fails before its durable commit.
 func TestTransitionRollback(t *testing.T) {
+	// Stage both a balance change and an outgoing event, then abort before
+	// commit to verify that neither side of the operation becomes visible.
 	s := testServer(t, t.TempDir())
 	want := errors.New("abort")
 	err := s.transact(context.Background(), func() error {

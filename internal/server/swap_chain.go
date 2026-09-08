@@ -34,6 +34,8 @@ type chainClaim struct {
 func witnessPreimage(tx *backend.TransactionInputs, outpoint string,
 	hash []byte) []byte {
 
+	// A matching hash in some unrelated input is not evidence that this
+	// funding output was claimed; restrict disclosure to the watched spend.
 	for _, input := range tx.Inputs {
 		if fmt.Sprintf("%s:%d", input.TxID, input.Vout) != outpoint {
 			continue
@@ -56,6 +58,8 @@ func witnessPreimage(tx *backend.TransactionInputs, outpoint string,
 // operator outage. Confirmed blocks and the mempool are authoritative even
 // when the receiver could not finalize an OOR package through the mailbox.
 func (s *Server) pollSwapChain(ctx context.Context) error {
+	// Snapshot only unresolved funded receives. Other swap phases either
+	// have no claim output yet or already know how to settle the payment.
 	s.mu.Lock()
 	var candidates []*outSwap
 	height := s.height
@@ -76,6 +80,9 @@ func (s *Server) pollSwapChain(ctx context.Context) error {
 		}
 	}
 	s.mu.Unlock()
+
+	// Read the indexed exit state and saved cursor together, then perform
+	// slow chain reads without holding the persistence lock.
 	for _, swap := range candidates {
 		s.mu.Lock()
 		coin, err := get[vtxoRecord](s, "vtxo/"+swap.Outpoint)
@@ -92,6 +99,10 @@ func (s *Server) pollSwapChain(ctx context.Context) error {
 		if coin == nil || coin.VTXO.Status != arkrpc.VTXOStatus_VTXO_STATUS_UNILATERAL_EXIT {
 			continue
 		}
+
+		// Start no earlier than the funding record, and never discard a
+		// known preimage: a reorg cannot make an observed secret
+		// unknown again.
 		if progress == nil {
 			progress = &chainClaim{
 				NextHeight: uint32(max(
@@ -129,6 +140,10 @@ func (s *Server) pollSwapChain(ctx context.Context) error {
 				progress.TxID = pending.TxID
 			}
 		}
+
+		// Revisit shallow reorgs while bounding each catch-up pass so a
+		// long outage cannot monopolize the worker and delay other
+		// swaps.
 		start := progress.NextHeight
 		if start > swapScanRewind {
 			start -= swapScanRewind
@@ -156,6 +171,10 @@ func (s *Server) pollSwapChain(ctx context.Context) error {
 			}
 			progress.NextHeight = h + 1
 		}
+
+		// Retain both progress and any disclosure before the settlement
+		// worker acts on it; recovery must survive another restart
+		// between the two steps.
 		if err := s.transact(ctx, func() error {
 			return s.put("chain-claim/"+swap.Outpoint, progress)
 		}); err != nil {

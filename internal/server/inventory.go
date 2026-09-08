@@ -46,7 +46,11 @@ func (s *Server) inventoryPolicy() (*arkscript.PolicyTemplate, error) {
 
 // inventoryCoins returns live treasury VTXOs whose participant keys are known.
 // It excludes reservations and near-expiry outputs just like client admission.
+// The caller must hold s.mu. Results are detached records; this helper
+// filters indexed state but leaves actual root checks to transfer admission.
 func (s *Server) inventoryCoins() ([]*vtxoRecord, error) {
+	// Treasury ownership is established by a saved script/key mapping, not
+	// by sharing the operator key that appears in every client policy.
 	var coins []*vtxoRecord
 	for key := range s.state.Records {
 		if !strings.HasPrefix(key, "vtxo/") {
@@ -80,6 +84,10 @@ func (s *Server) inventoryCoins() ([]*vtxoRecord, error) {
 			coins = append(coins, r)
 		}
 	}
+
+	// Order by transaction identity to reduce selection dependence on map
+	// iteration; siblings with the same txid need no relative priority
+	// here.
 	sort.Slice(coins, func(i, j int) bool {
 		return bytes.Compare(
 			coins[i].VTXO.Outpoint.Txid,
@@ -105,6 +113,9 @@ func indexedOutpoint(v *arkrpc.VTXO) (wire.OutPoint, error) {
 // ensureInventory builds a real treasury-funded round when spendable inventory
 // falls below half its target. Pending commitments prevent duplicate funding.
 func (s *Server) ensureInventory(ctx context.Context) error {
+	// Bound wallet work while serializing the refill decision with other
+	// funding operations; two callers must not both refill the same
+	// deficit.
 	ctx, cancel := context.WithTimeout(ctx, backend.RPCTimeout)
 	defer cancel()
 	return s.transact(ctx, func() error {
@@ -119,6 +130,10 @@ func (s *Server) ensureInventory(ctx context.Context) error {
 		if available >= uint64(s.cfg.InventoryAmount/2) {
 			return nil
 		}
+
+		// A pending treasury round is already replenishing inventory.
+		// Wait for its confirmation rather than spending more on-chain
+		// coins each poll.
 		for key := range s.state.Records {
 			if !strings.HasPrefix(key, "round/") {
 				continue
@@ -131,6 +146,10 @@ func (s *Server) ensureInventory(ctx context.Context) error {
 				return nil
 			}
 		}
+
+		// Register the spend-owner derivation before issuing treasury
+		// leaves so selection can recognize both initial inventory and
+		// later OOR change.
 		policy, err := s.inventoryPolicy()
 		if err != nil {
 			return err
@@ -150,6 +169,10 @@ func (s *Server) ensureInventory(ctx context.Context) error {
 
 			return err
 		}
+
+		// Split the refill into independent leaves for concurrent
+		// payments. Per-leaf tree cosigners keep leaf lookup distinct
+		// even with one spend policy.
 		id := uuid.New()
 		owners := make(map[string]*btcec.PrivateKey)
 		r := &roundRecord{ID: id.String(), Owner: s.id, Request: &roundpb.JoinRoundRequest{},
@@ -182,6 +205,10 @@ func (s *Server) ensureInventory(ctx context.Context) error {
 				},
 			)
 		}
+
+		// Use the same funded commitment construction as client rounds.
+		// The fixture knows both sides of the tree signing protocol for
+		// its own inventory.
 		if err := s.buildBatch(ctx, r); err != nil {
 			return err
 		}
@@ -195,6 +222,10 @@ func (s *Server) ensureInventory(ctx context.Context) error {
 			func(t *tree.Tree, node *tree.Node, id string,
 				digest []byte) error {
 
+				// Give each participant an independent nonce
+				// for this node; knowing all the private keys
+				// does not permit reusing MuSig2 nonce
+				// sessions.
 				participants := make(map[string]*nodeSigning)
 				peerNonces := make(map[string][]byte)
 				signing := r.Signing[id]
@@ -230,6 +261,11 @@ func (s *Server) ensureInventory(ctx context.Context) error {
 
 					return err
 				}
+
+				// Every participant signs against all other
+				// committed public nonces, reproducing the same
+				// aggregate session as a multi-party client
+				// round.
 				partials := make(map[string][]byte)
 				for peerID, participant := range participants {
 					others := map[string][]byte{
@@ -263,6 +299,10 @@ func (s *Server) ensureInventory(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+
+		// Save the complete tree before using the normal commitment
+		// finalizer. The publication worker can then recover this
+		// refill after a restart.
 		if err := s.put(roundKey(r.ID), r); err != nil {
 			return err
 		}
@@ -286,9 +326,14 @@ type inventoryFunding struct {
 // fundInventoryOutput atomically spends confirmed treasury VTXOs through the
 // same OOR validation and signing path as clients. The caller commits the
 // operation's session ID in this transaction before any notification escapes.
+// amount is in satoshis. Insufficient inventory, invalid policy or failed
+// chain validation returns an error that the caller must propagate to roll back
+// all staged changes.
 func (s *Server) fundInventoryOutput(ctx context.Context, policyRaw []byte,
 	amount uint64) (*inventoryFunding, error) {
 
+	// Resolve the destination policy before selecting funds; the requested
+	// amount is in satoshis and must form a valid non-dust VTXO.
 	policy, err := arkscript.DecodePolicyTemplate(policyRaw)
 	if err != nil {
 		return nil, err
@@ -305,6 +350,9 @@ func (s *Server) fundInventoryOutput(ctx context.Context, policyRaw []byte,
 			codes.InvalidArgument, "inventory output below minimum",
 		)
 	}
+
+	// Select enough value for either an exact payment or valid treasury
+	// change; a residual below the minimum cannot become an extra output.
 	available, err := s.inventoryCoins()
 	if err != nil {
 		return nil, err
@@ -326,6 +374,9 @@ func (s *Server) fundInventoryOutput(ctx context.Context, policyRaw []byte,
 			"confirmed Ark inventory unavailable",
 		)
 	}
+
+	// Conserve selected value by returning any excess to the known treasury
+	// policy, keeping that change available for subsequent transfers.
 	recipients := []oortx.RecipientOutput{
 		{
 			PkScript: script,
@@ -354,6 +405,9 @@ func (s *Server) fundInventoryOutput(ctx context.Context, policyRaw []byte,
 			VTXOPolicyTemplate: raw,
 		})
 	}
+
+	// Build owner-signed checkpoints from indexed coins and their saved key
+	// derivations, just as an external wallet would prepare an OOR package.
 	var checkpoints []*psbt.Packet
 	var outputs []oortx.CheckpointOutput
 	var descriptors []oorpb.SigningDescriptor
@@ -439,6 +493,9 @@ func (s *Server) fundInventoryOutput(ctx context.Context, policyRaw []byte,
 	if err != nil {
 		return nil, err
 	}
+
+	// Use the operator's validation to derive the exact Ark spend paths
+	// before producing the treasury-owner signatures.
 	bindings, err := s.validateOOR(
 		ark, checkpoints, descriptors, recipients,
 	)
@@ -461,6 +518,10 @@ func (s *Server) fundInventoryOutput(ctx context.Context, policyRaw []byte,
 	if err != nil {
 		return nil, err
 	}
+
+	// Run both protocol phases as the treasury mailbox. Normal admission
+	// and finalization enforce reservations and build recipient recovery
+	// events.
 	ctx = context.WithValue(ctx, principalKey{}, s.id)
 	resp, err := s.SubmitPackage(ctx, req)
 	if err != nil {
@@ -495,9 +556,15 @@ func (s *Server) fundInventoryOutput(ctx context.Context, policyRaw []byte,
 // spendOwnedVTXO materializes a swap participant's claim or refund through a
 // fully signed checkpoint and Ark transaction. The supplied path includes any
 // preimage and is checked against the authoritative indexed input.
+// The caller must run inside transact and commit the returned session with its
+// swap transition. The full indexed value returns to treasury inventory; errors
+// must abort the enclosing transition.
 func (s *Server) spendOwnedVTXO(ctx context.Context, record *vtxoRecord,
 	owner *btcec.PrivateKey, path *arkscript.SpendPath) (string, error) {
 
+	// Carry the selected claim or refund conditions into a checkpoint while
+	// retaining operator participation in its subsequent collaborative
+	// spend.
 	op, err := indexedOutpoint(record.VTXO)
 	if err != nil {
 		return "", err
@@ -533,12 +600,18 @@ func (s *Server) spendOwnedVTXO(ctx context.Context, record *vtxoRecord,
 	if err != nil {
 		return "", err
 	}
+
+	// The checkpoint must honor the original claim/refund timelocks before
+	// its txid is used as an input to the Ark transaction.
 	cp.PSBT.UnsignedTx.TxIn[0].Sequence = path.RequiredSequence
 	cp.PSBT.UnsignedTx.LockTime = path.RequiredLockTime
 	output, err := cp.ToCheckpointOutput()
 	if err != nil {
 		return "", err
 	}
+
+	// Return the recovered amount to ordinary treasury inventory so a
+	// settled swap no longer depends on a conditional policy.
 	policy, err := s.inventoryPolicy()
 	if err != nil {
 		return "", err
@@ -566,6 +639,9 @@ func (s *Server) spendOwnedVTXO(ctx context.Context, record *vtxoRecord,
 	if err != nil {
 		return "", err
 	}
+
+	// Bind the original policy and selected spend branch through the same
+	// validation and two-phase signing flow used for external clients.
 	descriptors := []oorpb.SigningDescriptor{
 		{
 			Outpoint:           op,
@@ -591,6 +667,9 @@ func (s *Server) spendOwnedVTXO(ctx context.Context, record *vtxoRecord,
 	if err != nil {
 		return "", err
 	}
+
+	// Finish both stages inside the caller's transaction; recording only an
+	// operator cosignature would leave the recovery spend incomplete.
 	ctx = context.WithValue(ctx, principalKey{}, s.id)
 	resp, err := s.SubmitPackage(ctx, request)
 	if err != nil {

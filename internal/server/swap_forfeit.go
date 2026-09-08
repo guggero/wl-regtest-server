@@ -30,11 +30,16 @@ type participantForfeit struct {
 }
 
 // forfeitPacket validates a swap refresh against an admitted round, its real
-// connector tree, and an equal-value replacement with the identical policy.
+// connector tree, and an equal-value replacement with the identical policy. The
+// caller must hold s.mu. Payload amounts are satoshis; returned metadata uses
+// values already checked against indexed funding and the admitted connector.
 func (s *Server) forfeitPacket(
 	p *swaprpc.ForfeitSignaturePayload) (*psbt.Packet, *arkscript.SpendPath,
 	error) {
 
+	// The request ID commits to the complete canonical payload. Verify that
+	// binding before using the ID to cache or solicit a participant
+	// signature.
 	if p == nil || len(p.RequestId) != 32 || len(p.PaymentHash) != 32 ||
 		len(p.UnsignedForfeitTx) > 100000 {
 
@@ -52,6 +57,9 @@ func (s *Server) forfeitPacket(
 			"forfeit request ID does not bind transcript",
 		)
 	}
+
+	// A remote refresh request must refer to the actual indexed conditional
+	// coin; payload amounts and scripts are not authoritative.
 	coin, err := get[vtxoRecord](s, "vtxo/"+p.VhtlcOutpoint)
 	if err != nil {
 		return nil, nil, err
@@ -64,6 +72,9 @@ func (s *Server) forfeitPacket(
 			"forfeit input differs from funded VTXO",
 		)
 	}
+
+	// Find the admitted round through its assigned connector. This proves
+	// the penalty is conditional on a real replacement commitment.
 	var selected *roundRecord
 	for key := range s.state.Records {
 		if !strings.HasPrefix(key, "round/") {
@@ -105,6 +116,10 @@ func (s *Server) forfeitPacket(
 			"forfeit has no admitted round connector",
 		)
 	}
+
+	// Require both the operator's actual penalty destination and an
+	// admitted equal-value replacement preserving the swap's original
+	// policy.
 	penalty, err := txscript.PayToTaprootScript(
 		txscript.ComputeTaprootKeyNoScript(
 			s.deriveKey(selected.ID + "/forfeit").PubKey(),
@@ -146,6 +161,9 @@ func (s *Server) forfeitPacket(
 				"value",
 		)
 	}
+
+	// Only the admitted leaf may authorize this penalty; validate the
+	// transaction shape and timelocks before constructing signing metadata.
 	path, err := arkscript.DecodeSpendPath(p.ForfeitSpendPath)
 	if err != nil {
 		return nil, nil, err
@@ -182,6 +200,9 @@ func (s *Server) forfeitPacket(
 
 		return nil, nil, errors.New("forfeit value or version mismatch")
 	}
+
+	// Populate prevouts only after their supplied values and scripts have
+	// been checked against the indexed coin and admitted connector.
 	packet, err := psbt.NewFromUnsignedTx(&tx)
 	if err != nil {
 		return nil, nil, err
@@ -197,7 +218,11 @@ func (s *Server) forfeitPacket(
 
 // SignInSwapForfeit signs a connector-bound refresh with the swap participant
 // key, or requests the same-Ark receiver's share through its durable mailbox.
+// Request identity binds the entire payload. Waiting for a remote participant
+// honors ctx; cancellation preserves the durable request for a later retry.
 func (s *Server) SignInSwapForfeit(ctx context.Context, req *swaprpc.SignInSwapForfeitRequest) (*swaprpc.SignInSwapForfeitResponse, error) {
+	// Validate the refresh and cache its participant transcript before
+	// returning a local share or asking a remote receiver to sign.
 	var response *swaprpc.SignInSwapForfeitResponse
 	var requestID string
 	err := s.transact(ctx, func() error {
@@ -219,6 +244,10 @@ func (s *Server) SignInSwapForfeit(ctx context.Context, req *swaprpc.SignInSwapF
 				"forfeit does not match funded in-swap",
 			)
 		}
+
+		// Retries recover a previously requested or completed share
+		// without starting a second remote signing request for the same
+		// transcript.
 		requestID = hex.EncodeToString(p.RequestId)
 		old, err := get[participantForfeit](
 			s, "participant-forfeit/"+requestID,
@@ -244,6 +273,10 @@ func (s *Server) SignInSwapForfeit(ctx context.Context, req *swaprpc.SignInSwapF
 			Payload:  p,
 			Receiver: r.Response.ServerPubkey,
 		}
+
+		// The operator does not own the direct same-Ark receiver key.
+		// Ask that receiver through its authenticated mailbox instead
+		// of substituting our key.
 		if r.InArk {
 			local, err := get[outSwap](s, "out-swap/"+id)
 			if err != nil {
@@ -263,6 +296,10 @@ func (s *Server) SignInSwapForfeit(ctx context.Context, req *swaprpc.SignInSwapF
 				return err
 			}
 		} else {
+
+			// For external swaps the treasury owns the receiver
+			// key, but it may sign only a branch that actually
+			// includes that key in the funded policy.
 			key := s.deriveKey("swap-receiver/" + id)
 			policy, err := arkscript.DecodePolicyTemplate(r.Policy)
 			if err != nil {
@@ -303,6 +340,9 @@ func (s *Server) SignInSwapForfeit(ctx context.Context, req *swaprpc.SignInSwapF
 	if response != nil {
 		return response, nil
 	}
+
+	// Wait outside the transaction for the remote share. Cancellation ends
+	// this RPC while preserving the request for a later client retry.
 	for {
 		s.mu.Lock()
 		record, err := get[participantForfeit](
@@ -329,7 +369,11 @@ func (s *Server) SignInSwapForfeit(ctx context.Context, req *swaprpc.SignInSwapF
 
 // SubmitOutSwapForfeitSignature accepts a receiver share only for a transcript
 // the operator previously requested, and verifies it against both real inputs.
+// An exact repeated share is accepted; a different signature for the saved
+// request is rejected. Success persists the share and wakes any waiting payer.
 func (s *Server) SubmitOutSwapForfeitSignature(ctx context.Context, req *swaprpc.SubmitOutSwapForfeitSignatureRequest) (*swaprpc.SubmitOutSwapForfeitSignatureResponse, error) {
+	// An unsolicited share cannot create a signing session. Match the saved
+	// request and expected receiver before rebuilding its signing digest.
 	err := s.transact(ctx, func() error {
 		p := req.GetPayload()
 		if p == nil || len(
@@ -365,6 +409,9 @@ func (s *Server) SubmitOutSwapForfeitSignature(ctx context.Context, req *swaprpc
 				"invalid participant key",
 			)
 		}
+
+		// The receiver signature commits to both the VTXO and connector
+		// prevouts under the admitted script leaf and SIGHASH_DEFAULT.
 		prev, err := packetPrevouts(packet)
 		if err != nil {
 			return err
@@ -387,6 +434,10 @@ func (s *Server) SubmitOutSwapForfeitSignature(ctx context.Context, req *swaprpc
 				"invalid receiver forfeit signature",
 			)
 		}
+
+		// Once accepted, the participant share is immutable; waking the
+		// waiting payer must always reveal the same durable signing
+		// transcript.
 		if record.Signature != nil &&
 			!proto.Equal(record.Signature, req.Signature) {
 
@@ -406,7 +457,12 @@ func (s *Server) SubmitOutSwapForfeitSignature(ctx context.Context, req *swaprpc
 
 // reconcileRefreshedSwaps moves funding references to equal-value replacement
 // vHTLCs once their signed refresh commitment confirms.
+// The caller must run inside the round-indexing transaction after replacement
+// VTXOs have been recorded; this helper does not change negotiated swap terms.
 func (s *Server) reconcileRefreshedSwaps(round *roundRecord) error {
+	// A confirmed refresh replaces an old conditional output only with the
+	// same policy and value in this round, preserving the negotiated swap
+	// rights.
 	for _, input := range round.Request.ForfeitRequests {
 		op, err := roundpb.OutpointFromProto(input.VtxoOutpoint)
 		if err != nil {
@@ -436,6 +492,10 @@ func (s *Server) reconcileRefreshedSwaps(round *roundRecord) error {
 		if replacement == "" {
 			continue
 		}
+
+		// Move both payer and receiver references together with round
+		// indexing so later claims and refunds target the confirmed
+		// replacement output.
 		for key := range s.state.Records {
 			switch {
 			case strings.HasPrefix(key, "in-swap/"):

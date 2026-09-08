@@ -17,6 +17,9 @@ import (
 // TestOORSigningAndValidation verifies authoritative value binding, operator
 // checkpoint construction, and script execution with both parties' signatures.
 func TestOORSigningAndValidation(t *testing.T) {
+	// Create a real standard policy and indexed input, keeping
+	// authoritative value separate from the PSBT metadata that the client
+	// submits.
 	s := testServer(t, t.TempDir())
 	owner, err := btcec.NewPrivateKey()
 	require.NoError(t, err)
@@ -46,6 +49,10 @@ func TestOORSigningAndValidation(t *testing.T) {
 	record := &vtxoRecord{VTXO: &arkrpc.VTXO{ValueSat: 10000, PkScript: script,
 		Status: arkrpc.VTXOStatus_VTXO_STATUS_LIVE, BatchExpiryHeight: 1440}, Policy: rawPolicy}
 	require.NoError(t, s.put("vtxo/"+prev.String(), record))
+
+	// Use public builders for the checkpoint and Ark stage so validation
+	// checks protocol-compatible construction rather than handcrafted
+	// placeholders.
 	checkpoint, err := oortx.BuildCheckpointPSBT(
 		arkscript.CheckpointPolicy{
 			OperatorKey: s.key.PubKey(), CSVDelay: 10,
@@ -80,6 +87,9 @@ func TestOORSigningAndValidation(t *testing.T) {
 			OwnerLeafPolicy:    rawLeaf,
 		},
 	}
+
+	// Complete the Ark stage and round-trip its PSBT serialization to catch
+	// duplicate metadata or signatures that cannot survive the wire format.
 	inputs, err := s.validateOOR(ark, packets, descriptors, recipients)
 	require.NoError(t, err)
 	bound := inputs[checkpoint.PSBT.UnsignedTx.TxHash()]
@@ -91,6 +101,9 @@ func TestOORSigningAndValidation(t *testing.T) {
 	require.NoError(t, err)
 	_, err = oortx.ValidateSubmitPackageSigned(ark, packets)
 	require.NoError(t, err)
+
+	// An operator share alone cannot spend the checkpoint. Only adding the
+	// owner share should make final witness execution succeed.
 	require.NoError(t, signPacketInput(checkpoint.PSBT, 0, s.key, spend))
 	_, err = signedPacket(checkpoint.PSBT)
 	require.Error(t, err)
@@ -98,6 +111,10 @@ func TestOORSigningAndValidation(t *testing.T) {
 	require.NoError(t, oortx.ValidateFinalizePackageSigned(ark, packets))
 	_, err = signedPacket(checkpoint.PSBT)
 	require.NoError(t, err)
+
+	// A fully signed package still cannot override indexed value or spent
+	// status; alter authoritative state to exercise both admission
+	// boundaries.
 	record.VTXO.ValueSat--
 	require.NoError(t, s.put("vtxo/"+prev.String(), record))
 	_, err = s.validateOOR(ark, packets, descriptors, recipients)

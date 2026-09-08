@@ -52,7 +52,13 @@ type creditRecord struct {
 // authorizeCredit verifies the upstream request-bound signature and commits its
 // nonce binding with the operation. An exact signed retry is safe; reuse for a
 // different request is rejected even when it carries a fresh valid signature.
+// The caller must be inside transact and propagate errors to roll back the
+// nonce write along with the rejected operation. It returns canonical account
+// identity and the request digest, excluding the authorization wrapper.
 func (s *Server) authorizeCredit(req proto.Message) (string, []byte, error) {
+	// The account key authorizes the complete typed request, independently
+	// of mailbox routing. Rebuild its digest before accepting any balance
+	// access.
 	digest, keyRaw, err := swaprpc.CreditAccountRequestDigest(req)
 	if err != nil {
 		return "", nil, status.Error(codes.InvalidArgument, err.Error())
@@ -70,6 +76,10 @@ func (s *Server) authorizeCredit(req proto.Message) (string, []byte, error) {
 			"credit account authorization required",
 		)
 	}
+
+	// Bound authorization lifetime separately from the operation lifetime;
+	// a long-lived invoice must not imply a long-lived spending
+	// authorization.
 	now := s.cfg.Clock.Now().Unix()
 	if auth.ExpiresAtUnix <= now || auth.ExpiresAtUnix > now+int64(
 		swaprpc.CreditAccountMaxAuthTTL/time.Second,
@@ -92,6 +102,9 @@ func (s *Server) authorizeCredit(req proto.Message) (string, []byte, error) {
 			codes.Unauthenticated, "invalid credit authorization",
 		)
 	}
+
+	// Persist nonce binding with the operation so replay is safe only for
+	// the exact signed authorization, even after a process restart.
 	account := hex.EncodeToString(keyRaw)
 	nonceKey := "credit-nonce/" + account + "/" +
 		hex.EncodeToString(auth.Nonce)
@@ -114,6 +127,9 @@ func (s *Server) authorizeCredit(req proto.Message) (string, []byte, error) {
 }
 
 // account retrieves the ledger, creating an empty value only for new accounts.
+// The caller must hold s.mu. The returned ledger is detached and must be
+// written with put to record changes; inconsistent reservations return an
+// error.
 func (s *Server) account(id string) (*creditAccount, error) {
 	a, err := get[creditAccount](s, "credit-account/"+id)
 	if err != nil {
@@ -122,6 +138,9 @@ func (s *Server) account(id string) (*creditAccount, error) {
 	if a == nil {
 		a = &creditAccount{}
 	}
+
+	// Check the ledger invariant before callers subtract reservations using
+	// unsigned arithmetic; corrupt state must not appear as a huge balance.
 	if a.Reserved > a.Finalized {
 		return nil, errors.New("credit reservations exceed ledger")
 	}
@@ -148,10 +167,16 @@ func creditIntentKey(account, key string) (string, error) {
 
 // CreateCredit records a funding intent before creating its real LND invoice
 // or returning a dedicated Ark destination. Retrying resumes the same intent.
+// Amounts are satoshis. The request needs a valid account authorization and
+// bounded idempotency key. An external invoice error may leave a durable intent
+// that the caller can recover by retrying the same operation.
 func (s *Server) CreateCredit(ctx context.Context,
 	req *swaprpc.CreateCreditRequest) (*swaprpc.CreateCreditResponse,
 	error) {
 
+	// First commit the authenticated funding intent and stable identity.
+	// Invoice creation happens afterward so uncertain RPC results are
+	// recoverable.
 	var operation string
 	err := s.transact(ctx, func() error {
 		account, digest, err := s.authorizeCredit(req)
@@ -184,6 +209,10 @@ func (s *Server) CreateCredit(ctx context.Context,
 				"Ark top-up below minimum",
 			)
 		}
+
+		// An idempotency key may recover its original funding
+		// destination but must never change amount, source, or other
+		// request-bound terms.
 		old, err := get[string](s, key)
 		if err != nil {
 			return err
@@ -218,6 +247,10 @@ func (s *Server) CreateCredit(ctx context.Context,
 					creditInvoiceLifetime,
 				)),
 			}}
+
+		// A dedicated top-up key ties an observed Ark payment to this
+		// operation and lets the treasury later spend the received
+		// value.
 		if req.Source == swaprpc.CreditFundingSource_CREDIT_FUNDING_SOURCE_ARK_TOPUP {
 			domain := "credit-topup/" + operation
 			pub := s.deriveKey(domain).PubKey()
@@ -245,6 +278,10 @@ func (s *Server) CreateCredit(ctx context.Context,
 			r.Operation.State = swaprpc.CreditOperationState_CREDIT_OPERATION_STATE_AWAITING_PAYMENT
 			r.Funding.State = r.Operation.State
 		} else {
+
+			// A deterministic invoice hash permits lookup after an
+			// ambiguous AddInvoice result without creating a second
+			// payable invoice.
 			preimage := s.deriveKey(
 				"credit-invoice/" + operation,
 			).Serialize()
@@ -260,6 +297,9 @@ func (s *Server) CreateCredit(ctx context.Context,
 	if err != nil {
 		return nil, err
 	}
+
+	// Reconcile only after ingress is durable; a disconnected caller or a
+	// failed backend call leaves enough state for background completion.
 	if err := s.pollCreditOperation(ctx, operation); err != nil {
 		return nil, err
 	}
@@ -277,6 +317,9 @@ func (s *Server) CreateCredit(ctx context.Context,
 func (s *Server) postCredit(r *creditRecord, direction string,
 	amount uint64) error {
 
+	// Ledger identity is operation plus direction. Retries may repeat an
+	// entry only with its original amount, preventing double credit or
+	// debit.
 	a, err := s.account(r.Account)
 	if err != nil {
 		return err
@@ -293,6 +336,9 @@ func (s *Server) postCredit(r *creditRecord, direction string,
 			return nil
 		}
 	}
+
+	// Funding increases finalized value; spending must consume an existing
+	// reservation and finalized balance together, never overdrawing either.
 	switch direction {
 	case "credit":
 		if amount > btcutil.MaxSatoshi-a.Finalized {
@@ -310,6 +356,9 @@ func (s *Server) postCredit(r *creditRecord, direction string,
 	default:
 		return errors.New("unknown credit ledger direction")
 	}
+
+	// Save the audit entry with the changed balance, allowing future
+	// retries to recognize the already applied movement.
 	a.Ledger = append(a.Ledger, &swaprpc.CreditLedgerEntry{
 		EntryId:     uuid.NewString(),
 		OperationId: r.Operation.OperationId,
@@ -322,9 +371,14 @@ func (s *Server) postCredit(r *creditRecord, direction string,
 
 // ListCredits returns authenticated balances and bounded recent history. It
 // never reveals invoice preimages or another account's operations.
+// Limit defaults to 100 and may not exceed 1000. Histories are newest first;
+// authorization nonce binding is recorded even though balances are only read.
 func (s *Server) ListCredits(ctx context.Context,
 	req *swaprpc.ListCreditsRequest) (*swaprpc.ListCreditsResponse, error) {
 
+	// Authorization nonce recording and the returned balance snapshot share
+	// a transaction so reserved and available totals describe the same
+	// state.
 	var resp *swaprpc.ListCreditsResponse
 	err := s.transact(ctx, func() error {
 		account, _, err := s.authorizeCredit(req)
@@ -364,6 +418,10 @@ func (s *Server) ListCredits(ctx context.Context,
 				)
 			}
 		}
+
+		// Present recent operations and ledger movements first,
+		// truncating only after account filtering so another account
+		// cannot affect the page size.
 		sort.Slice(resp.Operations, func(i, j int) bool {
 			return resp.Operations[i].CreatedAt.AsTime().After(
 				resp.Operations[j].CreatedAt.AsTime(),
@@ -389,6 +447,9 @@ func (s *Server) ListCredits(ctx context.Context,
 
 // pollCredits reconciles external funding independently of client retries.
 func (s *Server) pollCredits(ctx context.Context) error {
+	// Copy unresolved funding IDs under the lock, then release it before
+	// invoice RPCs; funding must complete even if the creating client
+	// disappears.
 	s.mu.Lock()
 	var ids []string
 	for key := range s.state.Records {
@@ -417,6 +478,8 @@ func (s *Server) pollCredits(ctx context.Context) error {
 // pollCreditOperation reconciles an invoice by its known hash across crashes,
 // or credits an exact, finalized OOR top-up belonging to its dedicated key.
 func (s *Server) pollCreditOperation(ctx context.Context, id string) error {
+	// Bound external reconciliation and work from a detached record so
+	// slow invoice lookup does not hold the global persistence lock.
 	ctx, cancel := context.WithTimeout(ctx, backend.RPCTimeout)
 	defer cancel()
 	s.mu.Lock()
@@ -428,6 +491,9 @@ func (s *Server) pollCreditOperation(ctx context.Context, id string) error {
 	if r == nil || r.Funding == nil || r.Operation.State == swaprpc.CreditOperationState_CREDIT_OPERATION_STATE_CREDITED || r.Operation.State == swaprpc.CreditOperationState_CREDIT_OPERATION_STATE_EXPIRED {
 		return nil
 	}
+
+	// The saved payment hash is the recovery anchor: look up the original
+	// invoice before attempting creation after an outage or ambiguous RPC.
 	var invoice *lnrpc.Invoice
 	if r.Source == swaprpc.CreditFundingSource_CREDIT_FUNDING_SOURCE_LIGHTNING_RECEIVE {
 		invoice, err = s.cfg.LND.Lightning.LookupInvoice(
@@ -474,6 +540,9 @@ func (s *Server) pollCreditOperation(ctx context.Context, id string) error {
 			return err
 		}
 	}
+
+	// Recheck durable completion after backend work because another poller
+	// may already have posted this funding operation.
 	return s.transact(ctx, func() error {
 		current, err := get[creditRecord](s, "credit-operation/"+id)
 		if err != nil {
@@ -484,6 +553,10 @@ func (s *Server) pollCreditOperation(ctx context.Context, id string) error {
 		}
 		oldState, oldInvoice := current.Operation.State, current.Operation.Invoice
 		funded := false
+
+		// Only the expected hash and amount can fund this operation.
+		// LND settlement, rather than invoice creation or acceptance,
+		// establishes payment.
 		if invoice != nil {
 			if invoice.Value != int64(
 				current.Operation.AmountSat,
@@ -504,6 +577,10 @@ func (s *Server) pollCreditOperation(ctx context.Context, id string) error {
 				current.Operation.State = swaprpc.CreditOperationState_CREDIT_OPERATION_STATE_EXPIRED
 			}
 		} else {
+
+			// For Ark funding, the unique destination and exact
+			// indexed amount identify the completed top-up even if
+			// treasury selection later spends it.
 			policy, err := arkscript.StandardVTXOTemplate(
 				s.deriveKey("credit-topup/"+id).PubKey(),
 				s.key.PubKey(), s.cfg.ExitDelay,
@@ -532,6 +609,10 @@ func (s *Server) pollCreditOperation(ctx context.Context, id string) error {
 				}
 			}
 		}
+
+		// Post the ledger movement with terminal operation state so
+		// neither concurrent reconciliation nor a restart can credit
+		// the same funding twice.
 		if funded {
 			if err := s.postCredit(
 				current, "credit", current.Operation.AmountSat,
@@ -557,10 +638,15 @@ func (s *Server) pollCreditOperation(ctx context.Context, id string) error {
 
 // RedeemCredit reserves credits and finalizes their real OOR transfer in one
 // durable transaction. Insufficient inventory leaves the account unchanged.
+// Amounts are satoshis and must meet the VTXO minimum; the destination is an
+// x-only owner key. An exact authorized retry returns the original session.
 func (s *Server) RedeemCredit(ctx context.Context,
 	req *swaprpc.RedeemCreditRequest) (*swaprpc.RedeemCreditResponse,
 	error) {
 
+	// Authorization, credit reservation, OOR transfer, and debit share one
+	// transaction. Any funding or validation failure rolls the entire
+	// redemption back.
 	var resp *swaprpc.RedeemCreditResponse
 	err := s.transact(ctx, func() error {
 		account, digest, err := s.authorizeCredit(req)
@@ -586,6 +672,10 @@ func (s *Server) RedeemCredit(ctx context.Context,
 				"x-only redemption destination required",
 			)
 		}
+
+		// Recover an exact redemption retry before checking today's
+		// available balance; the original successful debit may have
+		// consumed that balance.
 		old, err := get[string](s, key)
 		if err != nil {
 			return err
@@ -613,6 +703,9 @@ func (s *Server) RedeemCredit(ctx context.Context,
 			}
 			return nil
 		}
+
+		// Reserve only available credits, excluding amounts already
+		// promised to concurrent sends or receives.
 		a, err := s.account(account)
 		if err != nil {
 			return err
@@ -627,6 +720,10 @@ func (s *Server) RedeemCredit(ctx context.Context,
 		if err := s.put("credit-account/"+account, a); err != nil {
 			return err
 		}
+
+		// Redemption issues a real signed VTXO to the requested owner
+		// through treasury OOR funding, rather than only changing
+		// ledger numbers.
 		policy, err := arkscript.StandardVTXOTemplate(
 			pub, s.key.PubKey(), s.cfg.ExitDelay,
 		)
@@ -641,6 +738,10 @@ func (s *Server) RedeemCredit(ctx context.Context,
 		if err != nil {
 			return err
 		}
+
+		// Record the resulting session and debit together with retry
+		// identity, so a repeated request returns the existing transfer
+		// instead of issuing more.
 		now := timestamppb.New(s.cfg.Clock.Now())
 		id := uuid.NewString()
 		r := &creditRecord{Account: account, Digest: digest, Operation: &swaprpc.CreditOperation{OperationId: id, Type: swaprpc.CreditOperationType_CREDIT_OPERATION_TYPE_REDEMPTION,

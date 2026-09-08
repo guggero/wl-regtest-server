@@ -19,8 +19,12 @@ type Store struct {
 	db *sql.DB
 }
 
-// Open opens a private SQLite database and initializes its versioned schema.
+// Open creates or reopens the snapshot database at path. Newly created
+// directories and files are private because the snapshot contains signing seed
+// material. The caller owns Close; mutations must be serialized by the caller.
 func Open(path string) (*Store, error) {
+	// Create the file with restrictive permissions before SQLite opens it,
+	// rather than relying on the process umask to protect signing material.
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return nil, fmt.Errorf("create data directory: %w", err)
 	}
@@ -31,6 +35,11 @@ func Open(path string) (*Store, error) {
 	if err := f.Close(); err != nil {
 		return nil, err
 	}
+
+	// A single connection keeps connection-local SQLite settings
+	// consistent. WAL with FULL synchronization makes an acknowledged
+	// snapshot durable before the server exposes signatures or updates its
+	// mailbox readers.
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, err
@@ -66,6 +75,9 @@ func (s *Store) Load(ctx context.Context) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Schema interpretation is part of recovery. Refuse an unknown version
+	// instead of decoding signing transcripts under the wrong assumptions.
 	if version != 1 {
 		return nil, fmt.Errorf("unsupported state schema %d", version)
 	}

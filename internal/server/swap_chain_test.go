@@ -16,6 +16,8 @@ import (
 // TestUnilateralPreimageRecovery recovers a hashlock from the exact Bitcoin
 // input after an operator outage, and retains it across a process restart.
 func TestUnilateralPreimageRecovery(t *testing.T) {
+	// Simulate a confirmed claim while the mempool is empty, including an
+	// unrelated input with the same secret and a nonmatching witness item.
 	preimage := sha256.Sum256([]byte("unilateral-receive"))
 	hash := sha256.Sum256(preimage[:])
 	txid := hex.EncodeToString(make([]byte, 32))
@@ -77,6 +79,9 @@ func TestUnilateralPreimageRecovery(t *testing.T) {
 		},
 	))
 	defer node.Close()
+
+	// Resume an unresolved funded receive whose root was already unrolled;
+	// its saved creation height bounds the recovery scan.
 	dir := t.TempDir()
 	s := testServer(t, dir)
 	s.height = 101
@@ -109,11 +114,18 @@ func TestUnilateralPreimageRecovery(t *testing.T) {
 	found, err := s.observedPreimage(outpoint, hash[:])
 	require.NoError(t, err)
 	require.Equal(t, preimage[:], found)
+
+	// The observed secret must survive process replacement without another
+	// chain query, because settlement may resume after the original spend
+	// disappears.
 	require.NoError(t, s.Stop())
 	s = testServer(t, dir)
 	found, err = s.observedPreimage(outpoint, hash[:])
 	require.NoError(t, err)
 	require.Equal(t, preimage[:], found)
+
+	// Saved disclosure is scoped to both the funding outpoint and payment
+	// hash; neither a neighboring output nor a different hash may reuse it.
 	wrong := sha256.Sum256([]byte("other hash"))
 	found, err = s.observedPreimage(outpoint, wrong[:])
 	require.NoError(t, err)
