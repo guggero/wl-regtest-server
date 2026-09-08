@@ -10,10 +10,10 @@ test-race:
 	go test -race -timeout=5m ./internal/...
 
 fmt:
-	goformat -w $$(rg --files -g '*.go')
+	goformat -w .
 
 fmt-check:
-	goformat -check $$(rg --files -g '*.go')
+	goformat -check .
 
 itest:
 	WL_INTEGRATION=1 go test -count=1 -timeout=3m -v -run='^TestExpirySweepBitcoin$$' ./internal/server
