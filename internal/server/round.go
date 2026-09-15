@@ -424,6 +424,12 @@ func (s *Server) JoinRound(ctx context.Context,
 		r.Forfeits = append(r.Forfeits, record)
 	}
 
+	// Admitted requests are dispatched before the worker loop re-samples
+	// the tip, so the shared height can trail a client that stamped its
+	// proof with a block it has just seen. Validate against the node's
+	// current tip instead.
+	s.refreshHeight(ctx)
+
 	// Verify ownership against authoritative amounts and scripts, not the
 	// metadata supplied alongside the client's proof.
 	challenge, err := bip322.JoinRoundMessageChallenge(domain.Identifier)
@@ -484,6 +490,21 @@ func (s *Server) JoinRound(ctx context.Context,
 		return nil, err
 	}
 	return r.ack(), s.emitRound(r, roundpb.MethodJoinRoundQuote, r.Quote)
+}
+
+// refreshHeight replaces the shared tip sample with the node's current tip.
+// The worker loop samples the tip only after dispatching admitted requests, so
+// a join proof stamped with a block the client had just observed was checked
+// against the previous iteration's height; on a loaded host that lag reached a
+// whole block and valid joins were rejected as "not yet valid". A failed read
+// keeps the last sample rather than failing the request. Callers hold s.mu, as
+// transact does for every handler.
+func (s *Server) refreshHeight(ctx context.Context) {
+	info, err := s.cfg.Bitcoin.Info(ctx)
+	if err != nil {
+		return
+	}
+	s.height, s.blockHash = info.Blocks, info.BestBlockHash
 }
 
 // quote computes residual amounts once, applying the client's fixed/change
