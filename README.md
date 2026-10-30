@@ -13,7 +13,7 @@ It does not implement ordinary Loop products or production batching economics.
 
 ## Dependencies
 
-- Go 1.26.5, for a local build.
+- Go 1.27.3, for a local build.
 - Bitcoin Core 29 with `regtest`, `txindex`, wallet RPC and package relay enabled.
 - A dedicated, synchronized LND on the same regtest chain, funded on-chain and
   with a funded Lightning channel. Start it with `--requireinterceptor`.
@@ -28,7 +28,7 @@ docker build -f docker/lnd.Dockerfile -t guggero/wl-regtest-lnd:8ea98fd .
 ```
 
 The server pins the public Wavelength client at
-[`f7cc57a0042e`](https://github.com/lightninglabs/wavelength/commit/f7cc57a0042ec2e2106035fe0f2f5e6590967f8a).
+[`1475c1beb832`](https://github.com/lightninglabs/wavelength/commit/1475c1beb8326017a00833aa752ca1919ae7dc61).
 No local module replacements or closed server sources are required.
 
 ## Run

@@ -1,4 +1,4 @@
-FROM golang:1.26.5-bookworm AS build
+FROM golang:1.27.3-bookworm AS build
 ARG LND_COMMIT=8ea98fd522683648144dd4f0f014fce80e311630
 WORKDIR /src
 RUN git init && git remote add origin https://github.com/lightningnetwork/lnd.git && \

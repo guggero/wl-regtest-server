@@ -433,6 +433,14 @@ func mergeAncestry(destination, source *arkrpc.AncestryPath) error {
 	if dst.BatchOutpoint != src.BatchOutpoint {
 		return errors.New("ancestry commitment roots differ")
 	}
+	if destination.CommitmentSweepDelay != source.CommitmentSweepDelay ||
+		!bytes.Equal(
+			destination.CommitmentSweepKey,
+			source.CommitmentSweepKey,
+		) {
+
+		return errors.New("ancestry sweep evidence differs")
+	}
 	if err := mergeNodes(dst.Root, src.Root); err != nil {
 		return err
 	}
@@ -537,6 +545,7 @@ func (s *Server) indexOOR(r *oorRecord, id chainhash.Hash,
 			LeafTx: raw.Bytes(), OorArkPsbt: r.Final[0].ArkPsbt,
 			OorFinalCheckpointPsbts: r.Final[0].CheckpointPsbts,
 			ChainDepth:              r.Depth, AncestryPaths: r.Paths,
+			AncestryPackages: oorAncestryPackages(r),
 			OperatorPubkey: s.key.PubKey().SerializeCompressed(), ConstructionVersion: 1}
 		if len(r.Paths) > 0 {
 			v.CommitmentTxid = r.Paths[0].CommitmentTxid
@@ -607,4 +616,17 @@ func (s *Server) notifyOOR(event *arkrpc.OORRecipientEvent) error {
 		}
 	}
 	return nil
+}
+
+// oorAncestryPackages lists the finalized packages connecting the round-tree
+// leaves to an OOR output, ancestors first and the creating session last.
+// Clients bind the output to its signed ancestry through them before they
+// accept its batch expiry.
+func oorAncestryPackages(r *oorRecord) []*arkrpc.OORSessionPackage {
+	packages := make(
+		[]*arkrpc.OORSessionPackage, 0, len(r.Ancestors)+len(r.Final),
+	)
+	packages = append(packages, r.Ancestors...)
+
+	return append(packages, r.Final...)
 }

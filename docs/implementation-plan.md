@@ -70,7 +70,7 @@ The planning investigation passed the existing tests in all 13 selected upstream
 packages: `lib/arkscript`, `lib/tree`, `lib/tx`, its four subpackages, `swaprpc`,
 `serverconn`, `indexer`, `rpc/roundpb`, `rpc/oorpb`, and `sdk/swaps`. The swap SDK's
 HTTP tests required local socket access. The tests ran against the pinned upstream
-source with Go 1.26.5, read-only module resolution, and cached dependencies.
+source with Go 1.27.3, read-only module resolution, and cached dependencies.
 These establish useful library baselines, not end-to-end server compatibility.
 Real Docker interoperability remains an implementation acceptance requirement.
 
@@ -449,7 +449,7 @@ initial deliverables.
 
 Ship a multi-stage Dockerfile and a public, standalone Compose example. Pin Go
 and dependency versions, and pin runtime images by digest after interoperability
-tests. The repository currently declares Go 1.26.5; upstream requires Go 1.26.
+tests. The repository currently declares Go 1.27.3; upstream requires Go 1.27.3.
 The application binary and business logic are Go; Bitcoin Core, LND, and the
 client's chain indexer remain external services.
 

@@ -752,6 +752,14 @@ func (s *Server) indexRound(r *roundRecord) error {
 				return err
 			}
 			ancestry.CommitmentHeight = int32(r.ConfirmedHeight)
+
+			// Clients authenticate the batch expiry against the
+			// sweep leaf committed in the tree root, so they need
+			// the key and delay that leaf was built from.
+			ancestry.CommitmentSweepDelay = r.Batch.SweepDelay
+			ancestry.CommitmentSweepKey = bytes.Clone(
+				r.Batch.SweepKey,
+			)
 			tx, err := leaf.ToSignedTx()
 			if err != nil {
 				return err
