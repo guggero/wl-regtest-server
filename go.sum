@@ -952,6 +952,10 @@ github.com/grpc-ecosystem/grpc-gateway/v2 v2.7.0/go.mod h1:hgWBS7lorOAVIJEQMi4Zs
 github.com/grpc-ecosystem/grpc-gateway/v2 v2.11.3/go.mod h1:o//XUCC/F+yRGJoPO/VU0GSB0f8Nhgmxx0VIRUvaC0w=
 github.com/grpc-ecosystem/grpc-gateway/v2 v2.29.0 h1:5VipnvEpbqr2gA2VbM+nYVbkIF28c5ZQfqCBQ5g2xfk=
 github.com/grpc-ecosystem/grpc-gateway/v2 v2.29.0/go.mod h1:Hyl3n6Twe1hvtd9XUXDec4pTvgMSEixRuQKPTMH2bNs=
+github.com/guggero/wavelength v0.0.0-20261030202924-d0375860eb59 h1:xGPrmbJQWCE07Q/vAD4HOXxX3hABy75b5wCwdX4LRu0=
+github.com/guggero/wavelength v0.0.0-20261030202924-d0375860eb59/go.mod h1:d+wRny8/tDLkK8zPLVXJ24fQmwpTvMUo20TSo7DODas=
+github.com/guggero/wavelength/baselib v0.0.0-20261030202924-d0375860eb59 h1:gSK5hWENApTPyKoMRDbaE5Smeih4hWEj8rXpnohF1eQ=
+github.com/guggero/wavelength/baselib v0.0.0-20261030202924-d0375860eb59/go.mod h1:qKsP/6zxib5JGuUSnRPIh87lxThLHLVvDmLDMtoRehk=
 github.com/hashicorp/errwrap v1.0.0/go.mod h1:YH+1FKiLXxHSkmPseP+kNlulaMuP3n2brvKWEqk/Jc4=
 github.com/hashicorp/errwrap v1.1.0 h1:OxrOeh75EUXMY8TBjag2fzXGZ40LB6IKw45YeGUDY2I=
 github.com/hashicorp/errwrap v1.1.0/go.mod h1:YH+1FKiLXxHSkmPseP+kNlulaMuP3n2brvKWEqk/Jc4=
@@ -1061,10 +1065,6 @@ github.com/lightninglabs/taproot-assets v0.7.1-0.20261006112023-1434ab66b3bb h1:
 github.com/lightninglabs/taproot-assets v0.7.1-0.20261006112023-1434ab66b3bb/go.mod h1:ZxTc2Lr7ZMNj30AEiJcaiP/XaQfP4lD2Qa6xk+OrvHE=
 github.com/lightninglabs/taproot-assets/taprpc v1.1.1-0.20261005091416-8daf7dec6b63 h1:/xJddnJNDR0DkFuPzrMyLLoayIhfZlj44iMfP45AtHc=
 github.com/lightninglabs/taproot-assets/taprpc v1.1.1-0.20261005091416-8daf7dec6b63/go.mod h1:yXMmWIEjVZNweBvkRi4pro9ZxgY49uAF1hFGwC1m7xI=
-github.com/lightninglabs/wavelength v0.0.2-alpha.0.20261029180742-1475c1beb832 h1:SiBBc3Gzz8yvXin0t8ta7EeqYJU6VjVnVbt5Oeqvh0A=
-github.com/lightninglabs/wavelength v0.0.2-alpha.0.20261029180742-1475c1beb832/go.mod h1:d+wRny8/tDLkK8zPLVXJ24fQmwpTvMUo20TSo7DODas=
-github.com/lightninglabs/wavelength/baselib v0.0.0-20261029180742-1475c1beb832 h1:UYqlkxoNS1mWsF3DPt300CODZp/j/13p5YQh7MQOqTI=
-github.com/lightninglabs/wavelength/baselib v0.0.0-20261029180742-1475c1beb832/go.mod h1:qKsP/6zxib5JGuUSnRPIh87lxThLHLVvDmLDMtoRehk=
 github.com/lightningnetwork/lightning-onion v1.4.0 h1:qWE1icOH4AKXRcq1KCzt6P/TesqptgBTP++V7wowTc0=
 github.com/lightningnetwork/lightning-onion v1.4.0/go.mod h1:YDPkvVTVQ6FBBE6Yj93tDd7zA3iTSrryi9xq46i7bKE=
 github.com/lightningnetwork/lnd v0.21.0-beta.rc2.0.20260903094101-d66a7c137d32 h1:lwPqwW244WCcdOZGwmS+rrieC1hTPYaRvkjHC8KXDeY=
