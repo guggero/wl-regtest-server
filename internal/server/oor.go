@@ -546,7 +546,7 @@ func (s *Server) indexOOR(r *oorRecord, id chainhash.Hash,
 			OorFinalCheckpointPsbts: r.Final[0].CheckpointPsbts,
 			ChainDepth:              r.Depth, AncestryPaths: r.Paths,
 			AncestryPackages: oorAncestryPackages(r),
-			OperatorPubkey: s.key.PubKey().SerializeCompressed(), ConstructionVersion: 1}
+			OperatorPubkey:   s.key.PubKey().SerializeCompressed(), ConstructionVersion: uint32(arkrpc.ConstructionVersionV1)}
 		if len(r.Paths) > 0 {
 			v.CommitmentTxid = r.Paths[0].CommitmentTxid
 			v.BatchOutputIndex = r.Paths[0].TreePath.BatchOutpoint.Vout

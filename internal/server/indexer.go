@@ -785,7 +785,7 @@ func (s *Server) indexRound(r *roundRecord) error {
 				LeafTx: raw.Bytes(), AncestryPaths: []*arkrpc.AncestryPath{
 					ancestry,
 				},
-				OperatorPubkey: s.key.PubKey().SerializeCompressed(), ConstructionVersion: 1}
+				OperatorPubkey: s.key.PubKey().SerializeCompressed(), ConstructionVersion: uint32(arkrpc.ConstructionVersionV1)}
 
 			// Reindexing after a reorg must not revive value
 			// already consumed by an OOR transfer or a later
