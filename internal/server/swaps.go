@@ -141,6 +141,30 @@ func (s *Server) creditQuote(
 	return q
 }
 
+// quoteSettlement describes the funding path a quote previews. The credit a
+// payment uses includes its shortfall: the client tops that up before it
+// pays, so a dust invoice with no credit yet still settles from credit.
+// Direct same-Ark settlement applies only when no credit is involved and
+// the receiver attaches none, so no treasury bridge is needed.
+func quoteSettlement(amount uint64, quote *swaprpc.CreditQuote,
+	sameArk bool) swaprpc.SettlementType {
+
+	credit := quote.CreditAppliedSat + quote.CreditShortfallSat
+	switch {
+	case credit == amount:
+		return swaprpc.SettlementType_SETTLEMENT_TYPE_CREDIT
+
+	case credit > 0:
+		return swaprpc.SettlementType_SETTLEMENT_TYPE_MIXED
+
+	case sameArk:
+		return swaprpc.SettlementType_SETTLEMENT_TYPE_IN_ARK
+
+	default:
+		return swaprpc.SettlementType_SETTLEMENT_TYPE_LIGHTNING
+	}
+}
+
 // QuoteInSwap previews the same funding split used for admission without
 // reserving credits or exposing any signing artifact.
 // Invoice amounts must be whole satoshis on regtest. Accessing an account
@@ -181,20 +205,10 @@ func (s *Server) QuoteInSwap(ctx context.Context,
 			return err
 		}
 
-		// Describe the actual funding path: direct same-Ark settlement
-		// applies only when neither participant contributes credits
-		// requiring a treasury bridge.
-		settlement := swaprpc.SettlementType_SETTLEMENT_TYPE_LIGHTNING
-		if quote.CreditAppliedSat == amount {
-			settlement = swaprpc.SettlementType_SETTLEMENT_TYPE_CREDIT
-		} else if quote.CreditAppliedSat > 0 {
-			settlement = swaprpc.SettlementType_SETTLEMENT_TYPE_MIXED
-		}
-		if local != nil && quote.CreditAppliedSat == 0 &&
-			local.Response.AttachedCreditSat == 0 {
-
-			settlement = swaprpc.SettlementType_SETTLEMENT_TYPE_IN_ARK
-		}
+		settlement := quoteSettlement(
+			amount, quote, local != nil &&
+				local.Response.AttachedCreditSat == 0,
+		)
 		resp = &swaprpc.QuoteInSwapResponse{PaymentHash: invoice.PaymentHash[:], InvoiceAmountSat: amount, AmountSat: quote.ArkFundingSat, SettlementType: settlement,
 			Expiry: timestamppb.New(minTime(
 				invoice.Timestamp.Add(invoice.Expiry()),
