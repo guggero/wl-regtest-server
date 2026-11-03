@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -62,6 +63,16 @@ func TestCreditAuthorization(t *testing.T) {
 	_, err = s.ListCredits(context.Background(), req)
 	require.NoError(t, err)
 	_, err = s.ListCredits(context.Background(), req)
+	require.NoError(t, err)
+
+	// The wallet lists its whole history with the largest limit it can
+	// express. That must cap the page, not fail the read.
+	everything := &swaprpc.ListCreditsRequest{
+		AccountPubkey: key.PubKey().SerializeCompressed(),
+		Limit:         math.MaxUint32,
+	}
+	signCreditRequest(t, s, key, everything)
+	_, err = s.ListCredits(context.Background(), everything)
 	require.NoError(t, err)
 
 	// Changing even a read limit invalidates the request-bound signature;

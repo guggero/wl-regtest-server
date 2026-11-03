@@ -385,13 +385,11 @@ func (s *Server) ListCredits(ctx context.Context,
 		if err != nil {
 			return err
 		}
-		if req.Limit > 1000 {
-			return status.Error(
-				codes.InvalidArgument,
-				"credit history limit exceeds 1000",
-			)
-		}
-		limit := int(req.Limit)
+		// The wallet asks for its whole history with the largest
+		// limit it can express. Cap the page instead of refusing it:
+		// the wallet treats InvalidArgument as permanent and would
+		// abandon the credit operation that is waiting on this read.
+		limit := int(min(req.Limit, maxCreditHistory))
 		if limit == 0 {
 			limit = 100
 		}
@@ -444,6 +442,9 @@ func (s *Server) ListCredits(ctx context.Context,
 	})
 	return resp, err
 }
+
+// maxCreditHistory bounds the operations one ListCredits call returns.
+const maxCreditHistory = 1000
 
 // pollCredits reconciles external funding independently of client retries.
 func (s *Server) pollCredits(ctx context.Context) error {
