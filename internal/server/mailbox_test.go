@@ -101,9 +101,15 @@ func TestMailboxClientEvents(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		require.EqualValues(
-			t, 1,
-			result.(*arkrpc.GetInfoResponse).SelectedArkVersion,
+		reply := result.(*arkrpc.GetInfoResponse)
+		require.EqualValues(t, 1, reply.SelectedArkVersion)
+
+		// Clients refresh automatically only inside an advertised
+		// fee waiver, so the default terms must announce one.
+		require.Positive(t, reply.FreeRefreshWindowBlocks)
+		require.Equal(
+			t, s.cfg.FreeRefreshWindow,
+			reply.FreeRefreshWindowBlocks,
 		)
 		return nil
 	})

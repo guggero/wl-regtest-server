@@ -60,6 +60,13 @@ type Config struct {
 	ExitDelay     uint32
 	BatchLifetime uint32
 
+	// FreeRefreshWindow is the number of blocks before batch expiry in
+	// which the operator advertises a refresh fee waiver. Clients refresh
+	// automatically only inside it, so zero disables automatic refresh.
+	// The regtest operator charges no service fee, so the waiver is only
+	// an announcement.
+	FreeRefreshWindow uint32
+
 	// Amounts are satoshis. InventoryAmount is the refill target, divided
 	// among treasury leaves; MinAmount applies to each leaf.
 	MinAmount       int64
@@ -74,7 +81,7 @@ func DefaultConfig() Config {
 		DataDir: "data", Listen: "127.0.0.1:10010",
 		Clock: clock.NewDefaultClock(), Log: slog.Default(),
 		BoardingDelay: 144, ExitDelay: 10, BatchLifetime: 1440,
-		MinAmount: 1000, InventoryAmount: 10_000_000,
+		FreeRefreshWindow: 144, MinAmount: 1000, InventoryAmount: 10_000_000,
 	}
 }
 
@@ -146,6 +153,7 @@ func New(cfg Config) (*Server, error) {
 		return nil, errors.New("Bitcoin, LND and clock are required")
 	}
 	if cfg.ExitDelay == 0 || cfg.BatchLifetime <= cfg.BoardingDelay ||
+		cfg.FreeRefreshWindow > cfg.BatchLifetime ||
 		cfg.MinAmount < 330 ||
 		cfg.InventoryAmount < inventoryLeaves*cfg.MinAmount {
 

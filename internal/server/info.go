@@ -47,6 +47,7 @@ func (s *Server) info(req *arkrpc.GetInfoRequest) *arkrpc.GetInfoResponse {
 		VtxoExitDelay:     s.cfg.ExitDelay, DustLimit: s.cfg.MinAmount,
 		MinBoardingAmount: s.cfg.MinAmount, MinVtxoAmountSat: s.cfg.MinAmount,
 		FeeRate: 1, MinConfirmations: 1, SelectedArkVersion: selected,
+		FreeRefreshWindowBlocks: s.cfg.FreeRefreshWindow,
 		ArkVersionPolicies: []*arkrpc.ArkVersionPolicy{{Version: 1,
 			State: arkrpc.ArkVersionPolicy_STATE_ACTIVE}},
 	}
