@@ -212,6 +212,6 @@ require (
 	sigs.k8s.io/yaml v1.2.0 // indirect
 )
 
-replace github.com/lightninglabs/wavelength => github.com/guggero/wavelength v0.0.0-20261104065201-3cf8d0e0b4e8
+replace github.com/lightninglabs/wavelength => github.com/guggero/wavelength v0.0.0-20261104113554-6fc89cbad50d
 
-replace github.com/lightninglabs/wavelength/baselib => github.com/guggero/wavelength/baselib v0.0.0-20261104065201-3cf8d0e0b4e8
+replace github.com/lightninglabs/wavelength/baselib => github.com/guggero/wavelength/baselib v0.0.0-20261104113554-6fc89cbad50d
