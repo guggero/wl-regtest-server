@@ -128,6 +128,35 @@ func mailboxContext(t *testing.T, key *btcec.PrivateKey,
 	))
 }
 
+// TestSendWakesDispatcher pins the latency contract of Send: a persisted
+// request leaves one pending wake-up for the worker, so it is answered
+// without waiting for the next poll tick. Further requests before that
+// pass never block and need no second signal.
+func TestSendWakesDispatcher(t *testing.T) {
+	s := testServer(t, t.TempDir())
+	key, err := btcec.NewPrivateKey()
+	require.NoError(t, err)
+	id := serverconn.PubKeyMailboxID(key.PubKey())
+	target := serverconn.CompoundMailboxID(s.id, id)
+	body, err := anypb.New(wrapperspb.String("event"))
+	require.NoError(t, err)
+
+	for _, idempotencyKey := range []string{"event-1", "event-2"} {
+		req := &mailboxpb.SendRequest{Envelope: &mailboxpb.Envelope{
+			ProtocolVersion: 1, ArkProtocolVersion: 1,
+			Sender: id, Recipient: target,
+			IdempotencyKey: idempotencyKey, Body: body,
+			Rpc: &mailboxpb.RpcMeta{
+				Kind:    mailboxpb.RpcMeta_KIND_EVENT,
+				Service: "test", Method: "Apply", ReplyTo: id,
+			},
+		}}
+		_, err = s.Send(mailboxContext(t, key, target), req)
+		require.NoError(t, err)
+		require.Len(t, s.dispatchWake, 1)
+	}
+}
+
 // TestMailboxRecovery proves an admitted request survives process replacement,
 // executes once, and retains replay protection after its response is
 // acknowledged.

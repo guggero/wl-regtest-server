@@ -259,7 +259,18 @@ func (s *Server) Send(ctx context.Context,
 	if err != nil {
 		return nil, err
 	}
+	s.wakeDispatcher()
 	return &mailboxpb.SendResponse{Status: &mailboxpb.Status{Ok: true}}, nil
+}
+
+// wakeDispatcher asks the worker to dispatch persisted requests without
+// waiting for its next tick. It never blocks: a signal already pending
+// covers this request too.
+func (s *Server) wakeDispatcher() {
+	select {
+	case s.dispatchWake <- struct{}{}:
+	default:
+	}
 }
 
 // readOnlyMailbox identifies methods whose retries cannot duplicate an

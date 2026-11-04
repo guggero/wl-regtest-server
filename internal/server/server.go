@@ -126,6 +126,11 @@ type Server struct {
 	wake    chan struct{}
 	pending []delivery
 
+	// dispatchWake asks the worker to answer newly persisted mailbox
+	// requests now instead of on its next tick. It holds at most one
+	// signal: one dispatch pass serves every request persisted before it.
+	dispatchWake chan struct{}
+
 	// Workers share this cancellation root and join before the store
 	// closes. Each LND receiver is joined by its owning worker before
 	// reconnecting.
@@ -171,7 +176,8 @@ func New(cfg Config) (*Server, error) {
 		return nil, err
 	}
 	s := &Server{cfg: cfg, db: db, router: mailboxrpc.NewServeMux(),
-		wake: make(chan struct{}), failures: make(chan error, 1)}
+		wake: make(chan struct{}), failures: make(chan error, 1),
+		dispatchWake: make(chan struct{}, 1)}
 	raw, err := db.Load(context.Background())
 	if err == nil && len(raw) > 0 {
 		err = json.Unmarshal(raw, &s.state)
@@ -500,6 +506,20 @@ func (s *Server) run() {
 		// work.
 		case <-s.ctx.Done():
 			return
+
+		// A client waits on each request it sends, and sequential
+		// requests would otherwise each wait for a tick. Answer them now
+		// and leave the backend pollers on their own cadence, so a
+		// burst of requests does not also become a burst of chain
+		// queries.
+		case <-s.dispatchWake:
+			if err := s.dispatchPending(s.ctx); err != nil {
+				s.cfg.Log.Error(
+					"commit mailbox transition", "error",
+					err,
+				)
+			}
+			continue
 
 		// Use the configured clock so tests control when another poll
 		// is due.
