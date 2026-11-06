@@ -508,8 +508,8 @@ func (s *Server) run() {
 			return
 
 		// A client waits on each request it sends, and sequential
-		// requests would otherwise each wait for a tick. Answer them now
-		// and leave the backend pollers on their own cadence, so a
+		// requests would otherwise each wait for a tick. Answer them
+		// now and leave the backend pollers on their own cadence, so a
 		// burst of requests does not also become a burst of chain
 		// queries.
 		case <-s.dispatchWake:

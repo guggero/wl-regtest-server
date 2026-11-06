@@ -269,6 +269,7 @@ func (s *Server) Send(ctx context.Context,
 func (s *Server) wakeDispatcher() {
 	select {
 	case s.dispatchWake <- struct{}{}:
+
 	default:
 	}
 }

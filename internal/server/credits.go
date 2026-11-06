@@ -28,6 +28,9 @@ const (
 	// creditInvoiceLifetime bounds the funding interval of an account
 	// operation.
 	creditInvoiceLifetime = time.Hour
+
+	// maxCreditHistory bounds the operations one ListCredits call returns.
+	maxCreditHistory = 1000
 )
 
 // creditAccount is a durable ledger with reservations separate from finalized
@@ -385,6 +388,7 @@ func (s *Server) ListCredits(ctx context.Context,
 		if err != nil {
 			return err
 		}
+
 		// The wallet asks for its whole history with the largest
 		// limit it can express. Cap the page instead of refusing it:
 		// the wallet treats InvalidArgument as permanent and would
@@ -442,9 +446,6 @@ func (s *Server) ListCredits(ctx context.Context,
 	})
 	return resp, err
 }
-
-// maxCreditHistory bounds the operations one ListCredits call returns.
-const maxCreditHistory = 1000
 
 // pollCredits reconciles external funding independently of client retries.
 func (s *Server) pollCredits(ctx context.Context) error {

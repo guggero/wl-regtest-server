@@ -55,13 +55,16 @@ func TestQuoteSettlement(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			quote := s.creditQuote(tc.amount, tc.available, tc.maximum)
+			quote := s.creditQuote(
+				tc.amount, tc.available, tc.maximum,
+			)
 			require.Equal(
 				t, tc.want,
 				quoteSettlement(tc.amount, quote, tc.sameArk),
 			)
 			require.Equal(
-				t, tc.wantArkFundingZero, quote.ArkFundingSat == 0,
+				t, tc.wantArkFundingZero,
+				quote.ArkFundingSat == 0,
 			)
 		})
 	}
