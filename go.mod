@@ -17,11 +17,11 @@ require (
 	github.com/btcsuite/btcd/wire/v2 v2.0.0
 	github.com/btcsuite/btclog/v2 v2.0.1-0.20250728225537-6090e87c6c5b
 	github.com/google/uuid v1.6.0
-	github.com/lightninglabs/wavelength v0.0.2-alpha.0.20261029180742-1475c1beb832
+	github.com/lightninglabs/wavelength v0.0.2-alpha.0.20261106145005-68ad4b266d14
 	github.com/lightningnetwork/lnd v0.21.0-beta.rc2.0.20260903094101-d66a7c137d32
 	github.com/lightningnetwork/lnd/clock v1.1.1
 	github.com/lightningnetwork/lnd/fn/v2 v2.0.9
-	github.com/lightningnetwork/lnd/tlv v1.4.0
+	github.com/lightningnetwork/lnd/tlv v1.4.1
 	github.com/stretchr/testify v1.11.1
 	google.golang.org/grpc v1.83.2
 	google.golang.org/protobuf v1.36.11
@@ -114,10 +114,10 @@ require (
 	github.com/lightninglabs/loop v0.33.0-beta // indirect
 	github.com/lightninglabs/neutrino v0.18.0 // indirect
 	github.com/lightninglabs/neutrino/cache v1.1.4 // indirect
-	github.com/lightninglabs/tap-sdk v0.3.0 // indirect
+	github.com/lightninglabs/tap-sdk v0.3.1-0.20261104162906-3f69a40a5fae // indirect
 	github.com/lightninglabs/taproot-assets v0.7.1-0.20261006112023-1434ab66b3bb // indirect
 	github.com/lightninglabs/taproot-assets/taprpc v1.1.1-0.20261005091416-8daf7dec6b63 // indirect
-	github.com/lightninglabs/wavelength/baselib v0.0.0-20261029180742-1475c1beb832 // indirect
+	github.com/lightninglabs/wavelength/baselib v0.0.0-20261106145005-68ad4b266d14 // indirect
 	github.com/lightningnetwork/lightning-onion v1.4.0 // indirect
 	github.com/lightningnetwork/lnd/actor v0.0.6 // indirect
 	github.com/lightningnetwork/lnd/cert v1.2.2 // indirect
@@ -211,7 +211,3 @@ require (
 	pgregory.net/rapid v1.2.0 // indirect
 	sigs.k8s.io/yaml v1.2.0 // indirect
 )
-
-replace github.com/lightninglabs/wavelength => github.com/guggero/wavelength v0.0.0-20261104113554-6fc89cbad50d
-
-replace github.com/lightninglabs/wavelength/baselib => github.com/guggero/wavelength/baselib v0.0.0-20261104113554-6fc89cbad50d
