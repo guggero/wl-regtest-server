@@ -17,7 +17,7 @@ require (
 	github.com/btcsuite/btcd/wire/v2 v2.0.0
 	github.com/btcsuite/btclog/v2 v2.0.1-0.20250728225537-6090e87c6c5b
 	github.com/google/uuid v1.6.0
-	github.com/lightninglabs/wavelength v0.0.2-alpha.0.20261106145005-68ad4b266d14
+	github.com/lightninglabs/wavelength v0.0.2-alpha.0.20261117220904-ba08644dfc09
 	github.com/lightningnetwork/lnd v0.21.0-beta.rc2.0.20260903094101-d66a7c137d32
 	github.com/lightningnetwork/lnd/clock v1.1.1
 	github.com/lightningnetwork/lnd/fn/v2 v2.0.9
@@ -105,7 +105,7 @@ require (
 	github.com/json-iterator/go v1.1.12 // indirect
 	github.com/kcalvinalvin/anet v0.0.0-20251112173137-d8ddc1f6dbee // indirect
 	github.com/kkdai/bstream v1.0.0 // indirect
-	github.com/klauspost/compress v1.18.0 // indirect
+	github.com/klauspost/compress v1.18.7 // indirect
 	github.com/lib/pq v1.11.1 // indirect
 	github.com/lightninglabs/go-wasmsqlite v0.0.0-20260811033710-d14cd0d80aa0 // indirect
 	github.com/lightninglabs/gozmq v0.0.0-20191113021534-d20a764486bf // indirect
@@ -114,10 +114,10 @@ require (
 	github.com/lightninglabs/loop v0.33.0-beta // indirect
 	github.com/lightninglabs/neutrino v0.18.0 // indirect
 	github.com/lightninglabs/neutrino/cache v1.1.4 // indirect
-	github.com/lightninglabs/tap-sdk v0.3.1-0.20261104162906-3f69a40a5fae // indirect
-	github.com/lightninglabs/taproot-assets v0.7.1-0.20261006112023-1434ab66b3bb // indirect
-	github.com/lightninglabs/taproot-assets/taprpc v1.1.1-0.20261005091416-8daf7dec6b63 // indirect
-	github.com/lightninglabs/wavelength/baselib v0.0.0-20261106145005-68ad4b266d14 // indirect
+	github.com/lightninglabs/tap-sdk v0.3.1-0.20261116180250-12e49238b5c1 // indirect
+	github.com/lightninglabs/taproot-assets v0.7.1-0.20261113151742-18e87e38fe99 // indirect
+	github.com/lightninglabs/taproot-assets/taprpc v1.1.1-0.20261113151742-18e87e38fe99 // indirect
+	github.com/lightninglabs/wavelength/baselib v0.0.0-20261117220904-ba08644dfc09 // indirect
 	github.com/lightningnetwork/lightning-onion v1.4.0 // indirect
 	github.com/lightningnetwork/lnd/actor v0.0.6 // indirect
 	github.com/lightningnetwork/lnd/cert v1.2.2 // indirect
@@ -134,7 +134,7 @@ require (
 	github.com/moby/docker-image-spec v1.3.1 // indirect
 	github.com/moby/moby/api v1.54.2 // indirect
 	github.com/moby/moby/client v0.4.1 // indirect
-	github.com/moby/sys/user v0.3.0 // indirect
+	github.com/moby/sys/user v0.4.1 // indirect
 	github.com/moby/term v0.5.2 // indirect
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
 	github.com/modern-go/reflect2 v1.0.2 // indirect
